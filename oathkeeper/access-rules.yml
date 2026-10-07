@@ -1,0 +1,77 @@
+# Which routes exist and what they require. Requests matching no rule are rejected (404).
+# Glob syntax: <*> = one path segment, <**> = anything, <{a,b}> = alternatives.
+# Rules must not overlap: give each service its own prefix (/api/users/**, /api/app/**, ...).
+# Changes are picked up live, no restart needed.
+#
+# Logged-in rules run: authenticate -> hydrator (user-service profile) -> id_token (JWT)
+# -> cookie (blank the session cookie, so services never see it).
+
+# Public pages: passed through untouched.
+- id: public
+  match:
+    url: http://localhost:8080/<{,public/**}>
+    methods: [GET]
+  upstream:
+    url: http://app:80
+  authenticators:
+    - handler: noop
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: cookie
+
+# Logged-in pages: no session -> redirect to login, then back here.
+- id: pages
+  match:
+    url: http://localhost:8080/app<{,/**}>
+    methods: [GET, POST]
+  upstream:
+    url: http://app:80
+  authenticators:
+    - handler: cookie_session
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: hydrator
+    - handler: id_token
+    - handler: cookie
+  errors:
+    - handler: redirect
+
+# Logged-in API of the placeholder app: browser cookie or Kratos session token; neither -> 401 JSON.
+- id: app-api
+  match:
+    url: http://localhost:8080/api/app/<**>
+    methods: [GET, POST, PUT, PATCH, DELETE]
+  upstream:
+    url: http://app:80
+  authenticators:
+    - handler: cookie_session
+    - handler: bearer_token
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: hydrator
+    - handler: id_token
+    - handler: cookie
+  errors:
+    - handler: json
+
+# user-service public API (/api/users/me). Its internal port (3001) has no rule on purpose.
+- id: users-api
+  match:
+    url: http://localhost:8080/api/users/<**>
+    methods: [GET, PATCH]
+  upstream:
+    url: http://user-service:3000
+  authenticators:
+    - handler: cookie_session
+    - handler: bearer_token
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: hydrator
+    - handler: id_token
+    - handler: cookie
+  errors:
+    - handler: json

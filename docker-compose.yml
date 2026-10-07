@@ -1,0 +1,171 @@
+name: ory-auth
+
+x-kratos-env: &kratos-env
+  DSN: postgres://kratos:${POSTGRES_PASSWORD:?run `just init` first}@postgres:5432/kratos?sslmode=disable&max_conns=20&max_idle_conns=4
+  SECRETS_COOKIE: ${KRATOS_SECRET_COOKIE:?run `just init` first}
+  SECRETS_CIPHER: ${KRATOS_SECRET_CIPHER:?run `just init` first}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kratos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: kratos
+    ports:
+      - "127.0.0.1:5432:5432" # local `cargo run` / `cargo test` of user-service
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kratos -d kratos"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Creates user-service's own role + database (idempotent, runs on every `up`).
+  users-db-init:
+    image: postgres:17-alpine
+    environment:
+      PGHOST: postgres
+      PGUSER: kratos
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      USERS_DB_PASSWORD: ${USERS_DB_PASSWORD:?run `just init` first}
+    volumes:
+      - ./postgres/create-users-db.sql:/create-users-db.sql:ro
+    command: ["sh", "-c", 'psql -v ON_ERROR_STOP=1 -v pw="$$USERS_DB_PASSWORD" -d kratos -f /create-users-db.sql']
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  kratos-migrate:
+    image: oryd/kratos:v26.2.0
+    environment: *kratos-env
+    volumes:
+      - ./kratos:/etc/config/kratos:ro
+    command: -c /etc/config/kratos/kratos.yml migrate sql -e --yes
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  kratos:
+    image: oryd/kratos:v26.2.0
+    restart: unless-stopped
+    ports:
+      - "4433:4433"           # public API (browser-facing)
+      - "127.0.0.1:4434:4434" # admin API (never expose this publicly)
+    environment:
+      <<: *kratos-env
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+    volumes:
+      - ./kratos:/etc/config/kratos:ro
+    entrypoint: ["/bin/sh", "/etc/config/kratos/entrypoint.sh"]
+    # --dev relaxes cookie security (no HTTPS needed). Remove it in production.
+    command: serve -c /etc/config/kratos/kratos.yml --dev --watch-courier
+    depends_on:
+      kratos-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4434/admin/health/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Ready-made login / registration / settings / recovery / verification pages.
+  kratos-ui:
+    image: oryd/kratos-selfservice-ui-node:v26.2.0
+    restart: unless-stopped
+    ports:
+      - "4455:4455"
+    environment:
+      PORT: 4455
+      KRATOS_PUBLIC_URL: http://kratos:4433/
+      KRATOS_BROWSER_URL: http://localhost:4433/
+      COOKIE_SECRET: ${UI_COOKIE_SECRET:?run `just init` first}
+      CSRF_COOKIE_NAME: ory_csrf_ui
+      CSRF_COOKIE_SECRET: ${UI_CSRF_COOKIE_SECRET:?run `just init` first}
+      DANGEROUSLY_DISABLE_SECURE_CSRF_COOKIES: "true" # plain-HTTP localhost only
+    depends_on:
+      kratos:
+        condition: service_healthy
+
+  # Catches every email Kratos sends (verification, recovery, login codes).
+  mailpit:
+    image: axllent/mailpit:v1.31
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+
+  # Front door for your app: checks the Kratos session, forwards requests with a signed JWT.
+  oathkeeper:
+    image: oryd/oathkeeper:v26.2.0
+    restart: unless-stopped
+    ports:
+      - "8080:4455"           # proxy: this is your app's URL
+      - "127.0.0.1:4456:4456" # API: JWKS at /.well-known/jwks.json, rule debugging
+    environment:
+      # Overrides mutators.hydrator.config.api.auth.basic.password in oathkeeper.yml.
+      MUTATORS_HYDRATOR_CONFIG_API_AUTH_BASIC_PASSWORD: ${HYDRATOR_PASSWORD:?run `just init` first}
+    volumes:
+      - ./oathkeeper:/etc/config/oathkeeper:ro
+    command: serve --config /etc/config/oathkeeper/oathkeeper.yml
+    depends_on:
+      kratos:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4456/health/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # PLACEHOLDER: replace with your own service. It echoes requests back, so you
+  # can see the JWT Oathkeeper adds. Not published on the host on purpose: all
+  # traffic must go through Oathkeeper. Point access-rules.yml upstreams at your service.
+  app:
+    image: traefik/whoami:v1.12.0
+    restart: unless-stopped
+
+  # Owns user data (profile, roles), keyed by the Kratos identity id. Hydrates every
+  # JWT via Oathkeeper. Not published on the host: :3000 is reached through Oathkeeper
+  # (/api/users/**), :3001 (/internal/hydrate) only by Oathkeeper itself.
+  # Applies user-service's migrations (embedded in its binary), then exits.
+  # Same image as user-service; runs on every `up`, a no-op when nothing is pending.
+  user-service-migrate:
+    build: ./user-service
+    image: ory-auth/user-service
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: postgres://users:${USERS_DB_PASSWORD}@postgres:5432/users
+      RUST_LOG: info,sqlx=warn
+    depends_on:
+      users-db-init:
+        condition: service_completed_successfully
+
+  user-service:
+    build: ./user-service
+    image: ory-auth/user-service
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://users:${USERS_DB_PASSWORD}@postgres:5432/users
+      HYDRATOR_PASSWORD: ${HYDRATOR_PASSWORD}
+      JWKS_URL: http://oathkeeper:4456/.well-known/jwks.json
+      JWT_ISSUER: http://localhost:8080/
+      KRATOS_ADMIN_URL: http://kratos:4434
+      RUST_LOG: info,user_service=debug,sqlx=warn
+    depends_on:
+      user-service-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/user-service", "healthcheck"]
+      # Probe every second while starting up, then back off for the container's life.
+      start_period: 60s
+      start_interval: 1s
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  postgres-data:
