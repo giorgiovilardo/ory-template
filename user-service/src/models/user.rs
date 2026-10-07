@@ -19,6 +19,13 @@ pub struct User {
     pub updated_at: OffsetDateTime,
 }
 
+/// A user together with their roles, read in one query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserWithRoles {
+    pub user: User,
+    pub roles: Vec<Role>,
+}
+
 /// What the hydrator adds to the Oathkeeper session as `extra.profile`, and therefore
 /// what ends up in every JWT. Kept separate from `User` so a new column never leaks
 /// into tokens by accident: every claim is an explicit decision.

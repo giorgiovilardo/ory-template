@@ -6,8 +6,19 @@ RUN apk add --no-cache musl-dev
 # build, so they read the committed `.sqlx/` data (`cargo sqlx prepare`) instead.
 ENV SQLX_OFFLINE=true
 WORKDIR /src
+
+# Dependencies first, against a stub main.rs: this layer is only rebuilt when
+# Cargo.toml or Cargo.lock change, not on every source edit.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release --locked
+
 COPY . .
-RUN cargo build --release --locked && cp target/release/user-service /user-service
+# Cargo decides what's stale by mtime, and COPY keeps the files' (older) mtimes, so
+# without this it could consider the stub's build up to date and ship the stub.
+RUN touch src/main.rs \
+    && cargo build --release --locked \
+    && cp target/release/user-service /user-service
 
 # Just the binary. No shell, no package manager, nothing to exploit.
 FROM scratch

@@ -8,7 +8,7 @@ const MAX_LEN: usize = 320;
 ///
 /// Emails reach this service from Kratos, which already validated them against the
 /// identity schema, so this is a sanity check rather than full RFC 5322 validation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(try_from = "String", into = "String")]
 #[sqlx(transparent)]
 pub struct Email(String);
@@ -23,29 +23,22 @@ pub enum EmailError {
     Malformed,
 }
 
-impl EmailError {
-    /// Stable machine-readable code for API responses.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::Empty => "email_empty",
-            Self::TooLong => "email_too_long",
-            Self::Malformed => "email_malformed",
-        }
-    }
-}
-
 impl TryFrom<String> for Email {
     type Error = EmailError;
 
     fn try_from(raw: String) -> Result<Self, Self::Error> {
-        let email = raw.trim().to_lowercase();
+        let trimmed = raw.trim();
 
-        if email.is_empty() {
+        if trimmed.is_empty() {
             return Err(EmailError::Empty);
         }
-        if email.len() > MAX_LEN {
+        // Kratos' `maxLength: 320` counts characters of the address as entered, so count
+        // the same way: not bytes, and before lowercasing (which can add characters).
+        // Otherwise an international address Kratos accepted could be refused here.
+        if trimmed.chars().count() > MAX_LEN {
             return Err(EmailError::TooLong);
         }
+        let email = trimmed.to_lowercase();
         match email.split_once('@') {
             Some((local, domain))
                 if !local.is_empty()
@@ -120,6 +113,23 @@ mod tests {
     }
 
     #[test]
+    fn length_limit_counts_characters_like_kratos() {
+        // 320 characters, but 640 bytes, and 'İ' lowercases to two characters.
+        for ch in ["é", "İ"] {
+            let at_limit = format!("{}@b", ch.repeat(MAX_LEN - 2));
+            assert_eq!(at_limit.chars().count(), MAX_LEN);
+            assert!(at_limit.parse::<Email>().is_ok(), "{ch}: at the limit");
+
+            let over = format!("{}@b", ch.repeat(MAX_LEN - 1));
+            assert_eq!(
+                over.parse::<Email>(),
+                Err(EmailError::TooLong),
+                "{ch}: over"
+            );
+        }
+    }
+
+    #[test]
     fn deserializing_validates() {
         let email: Email = serde_json::from_str(r#"" Ada@Example.com""#).unwrap();
         assert_eq!(email.as_ref(), "ada@example.com");
@@ -135,11 +145,5 @@ mod tests {
             serde_json::to_string(&email).unwrap(),
             r#""ada@example.com""#
         );
-    }
-
-    #[test]
-    fn errors_have_message_and_stable_code() {
-        assert_eq!(EmailError::Empty.to_string(), "email is empty");
-        assert_eq!(EmailError::Empty.code(), "email_empty");
     }
 }

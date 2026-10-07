@@ -5,15 +5,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use crate::models::{DisplayNameError, EmailError};
+use crate::models::DisplayNameError;
 
 /// Every handler returns `Result<_, AppError>`; this is the only place that decides
 /// status codes and the error body: `{"error": {"code": "...", "message": "..."}}`.
 /// Clients branch on `code` (stable); `message` is for humans and may change.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error(transparent)]
-    Email(#[from] EmailError),
     #[error(transparent)]
     DisplayName(#[from] DisplayNameError),
     #[error(transparent)]
@@ -33,7 +31,6 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
-            Self::Email(e) => (StatusCode::UNPROCESSABLE_ENTITY, e.code()),
             Self::DisplayName(e) => (StatusCode::UNPROCESSABLE_ENTITY, e.code()),
             Self::Json(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_body"),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),

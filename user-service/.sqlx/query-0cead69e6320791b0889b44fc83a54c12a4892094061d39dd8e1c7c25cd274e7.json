@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "update users set email = $2, updated_at = now() where id = $1\n               returning id, email as \"email: Email\", display_name as \"display_name: DisplayName\", created_at, updated_at",
+  "query": "with updated as (\n               update users set display_name = $2, updated_at = now() where id = $1\n               returning id, email, display_name, created_at, updated_at\n           )\n           select id, email as \"email: Email\", display_name as \"display_name: DisplayName\", created_at, updated_at,\n                  array(select role from user_roles where user_id = updated.id order by role) as \"roles!: Vec<Role>\"\n           from updated",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,12 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 5,
+        "name": "roles!: Vec<Role>",
+        "type_info": "TextArray",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -70,8 +76,9 @@
       false,
       true,
       false,
-      false
+      false,
+      null
     ]
   },
-  "hash": "ea8ccc76795ad1c1d010dbb376fa87ac7ba3cbf373159401d846a3f27251908f"
+  "hash": "0cead69e6320791b0889b44fc83a54c12a4892094061d39dd8e1c7c25cd274e7"
 }

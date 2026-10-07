@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into users (id, email) values ($1, $2)\n           on conflict (id) do nothing\n           returning id, email as \"email: Email\", display_name as \"display_name: DisplayName\", created_at, updated_at",
+  "query": "select id, email as \"email: Email\", display_name as \"display_name: DisplayName\", created_at, updated_at,\n                  array(select role from user_roles where user_id = users.id order by role) as \"roles!: Vec<Role>\"\n           from users where id = $1",
   "describe": {
     "columns": [
       {
@@ -57,12 +57,17 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 5,
+        "name": "roles!: Vec<Role>",
+        "type_info": "TextArray",
+        "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -70,8 +75,9 @@
       false,
       true,
       false,
-      false
+      false,
+      null
     ]
   },
-  "hash": "29564a0077c24cffcaa7151677c8070c9a2f90beb510ef667b923f9ea16935f2"
+  "hash": "3ddcc3aef7420d3fc5088f996a5f3dc80e240607d7ebd928b8350c283a9e660c"
 }

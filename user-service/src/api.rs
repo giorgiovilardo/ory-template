@@ -9,10 +9,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::auth::Claims;
 use crate::db;
 use crate::error::{AppError, AppJson};
-use crate::models::{DisplayName, Role, User};
-use crate::state::AppState;
+use crate::models::{DisplayName, Role, User, UserWithRoles};
+use crate::state::ApiState;
 
-pub fn router(state: AppState) -> Router {
+pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/users/me", get(get_me).patch(update_me))
@@ -27,15 +27,15 @@ struct MeResponse {
 }
 
 async fn get_me(
-    State(state): State<AppState>,
+    State(state): State<ApiState>,
     claims: Claims,
 ) -> Result<Json<MeResponse>, AppError> {
     // The hydrator created the row before this request reached us; NotFound means
     // the request bypassed it (or the user was just deleted).
-    let user = db::find_by_id(&state.db, claims.sub)
+    let found = db::find_with_roles(&state.db, claims.sub)
         .await?
         .ok_or(AppError::NotFound)?;
-    me(&state, user).await
+    Ok(Json(found.into()))
 }
 
 /// PATCH semantics: a missing field is left alone, `null` clears it.
@@ -51,36 +51,33 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Optio
 }
 
 async fn update_me(
-    State(state): State<AppState>,
+    State(state): State<ApiState>,
     claims: Claims,
     AppJson(body): AppJson<UpdateMe>,
 ) -> Result<Json<MeResponse>, AppError> {
-    let user = match body.display_name {
-        None => db::find_by_id(&state.db, claims.sub).await?,
+    let found = match body.display_name {
+        None => db::find_with_roles(&state.db, claims.sub).await?,
         Some(raw) => {
             // Parsed here (not in the struct) so a bad name gets its precise error code.
             let name = raw.map(DisplayName::try_from).transpose()?;
             db::set_display_name(&state.db, claims.sub, name.as_ref()).await?
         }
     };
-    me(&state, user.ok_or(AppError::NotFound)?).await
+    Ok(Json(found.ok_or(AppError::NotFound)?.into()))
 }
 
-async fn me(state: &AppState, user: User) -> Result<Json<MeResponse>, AppError> {
-    let roles = db::roles_of(&state.db, user.id).await?;
-    Ok(Json(MeResponse { user, roles }))
+impl From<UserWithRoles> for MeResponse {
+    fn from(UserWithRoles { user, roles }: UserWithRoles) -> Self {
+        Self { user, roles }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode, header};
-    use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use sqlx::PgPool;
-    use tower::ServiceExt;
     use uuid::Uuid;
 
     use super::*;
@@ -92,11 +89,7 @@ mod tests {
         token: Option<String>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let app = router(AppState {
-            db: db.clone(),
-            verifier: Arc::new(testing::verifier()),
-            hydrator_password: "unused".into(),
-        });
+        let app = router(crate::testing::api_state(db.clone()));
         let mut req = Request::builder().method(method).uri("/api/users/me");
         if let Some(token) = token {
             req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -107,13 +100,7 @@ mod tests {
                 .body(Body::from(b.to_string())),
             None => req.body(Body::empty()),
         };
-        let res = app.oneshot(req.unwrap()).await.unwrap();
-        let status = res.status();
-        let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+        crate::testing::send(app, req.unwrap()).await
     }
 
     async fn existing_user(db: &PgPool) -> (Uuid, String) {

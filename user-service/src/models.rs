@@ -4,6 +4,6 @@ mod role;
 mod user;
 
 pub use display_name::{DisplayName, DisplayNameError};
-pub use email::{Email, EmailError};
+pub use email::Email;
 pub use role::Role;
-pub use user::{Profile, User};
+pub use user::{Profile, User, UserWithRoles};

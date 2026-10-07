@@ -8,22 +8,20 @@ mod hydrate;
 mod kratos;
 mod models;
 mod state;
+#[cfg(test)]
+mod testing;
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::Context;
-use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use crate::auth::JwtVerifier;
 use crate::config::Config;
-use crate::state::AppState;
+use crate::state::{ApiState, HydrateState};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -32,18 +30,25 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    // Only the server needs worker threads: the one-shot subcommands (the healthcheck
+    // runs every 30s for the container's life) get a single-threaded runtime.
+    let mut runtime = match args.as_slice() {
+        [] | ["serve"] => tokio::runtime::Builder::new_multi_thread(),
+        _ => tokio::runtime::Builder::new_current_thread(),
+    };
+    runtime.enable_all().build()?.block_on(run(&args))
+}
+
+async fn run(args: &[&str]) -> anyhow::Result<()> {
+    match args {
         [] | ["serve"] => serve().await,
         ["migrate"] => cli::migrate().await,
         ["healthcheck"] => cli::healthcheck().await,
         ["grant-role", email, role] => cli::grant_role(email, role).await,
         ["revoke-role", email, role] => cli::revoke_role(email, role).await,
-        ["forget-user", email] => cli::forget_user(email).await,
+        ["forget-user", email_or_id] => cli::forget_user(email_or_id).await,
         _ => {
             eprintln!("{}", cli::USAGE);
             std::process::exit(2);
@@ -54,26 +59,22 @@ async fn main() -> anyhow::Result<()> {
 async fn serve() -> anyhow::Result<()> {
     let config = Config::from_env()?;
 
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(&config.database_url)
-        .await
-        .context("connecting to the database")?;
+    let db = config::connect_pool(&config.database_url).await?;
     // No migrations here: the one-shot `user-service migrate` job runs them before
     // this starts (see docker-compose.yml), so serving never needs DDL rights.
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let state = AppState {
-        db,
+    let http = config::http_client()?;
+    let api_state = ApiState {
+        db: db.clone(),
         verifier: Arc::new(JwtVerifier::remote(
             config.jwks_url,
             config.jwt_issuer,
             http,
         )),
-        hydrator_password: config.hydrator_password.into(),
+    };
+    let hydrate_state = HydrateState {
+        db,
+        password: config.hydrator_password.into(),
     };
 
     // Two listeners: Oathkeeper routes only to the public one, so the internal
@@ -81,13 +82,13 @@ async fn serve() -> anyhow::Result<()> {
     // TraceLayer's default spans log method + path only, never headers (the hydrator
     // receives the raw Kratos session cookie).
     let public = axum::serve(
-        TcpListener::bind(&config.public_addr).await?,
-        api::router(state.clone()).layer(TraceLayer::new_for_http()),
+        TcpListener::bind(config.public_addr).await?,
+        api::router(api_state).layer(TraceLayer::new_for_http()),
     )
     .with_graceful_shutdown(shutdown_signal());
     let internal = axum::serve(
-        TcpListener::bind(&config.internal_addr).await?,
-        hydrate::router(state).layer(TraceLayer::new_for_http()),
+        TcpListener::bind(config.internal_addr).await?,
+        hydrate::router(hydrate_state).layer(TraceLayer::new_for_http()),
     )
     .with_graceful_shutdown(shutdown_signal());
 

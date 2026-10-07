@@ -1,11 +1,9 @@
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
 
 const MAX_CHARS: usize = 100;
 
 /// A user's public name: trimmed, 1..=100 characters, no control characters.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(try_from = "String", into = "String")]
 #[sqlx(transparent)]
 pub struct DisplayName(String);
@@ -60,12 +58,6 @@ impl From<DisplayName> for String {
 impl AsRef<str> for DisplayName {
     fn as_ref(&self) -> &str {
         &self.0
-    }
-}
-
-impl fmt::Display for DisplayName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 

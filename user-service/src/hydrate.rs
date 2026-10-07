@@ -8,7 +8,8 @@
 //! - Oathkeeper also forwards the original request headers (incl. the Kratos session
 //!   cookie), so never log request headers here.
 
-use axum::extract::State;
+use axum::extract::{FromRequestParts, State};
+use axum::http::request::Parts;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::TypedHeader;
@@ -21,12 +22,12 @@ use subtle::ConstantTimeEq;
 use crate::db;
 use crate::error::{AppError, AppJson};
 use crate::kratos::KratosSession;
-use crate::models::Profile;
-use crate::state::AppState;
+use crate::models::{Profile, UserWithRoles};
+use crate::state::HydrateState;
 
 pub const HYDRATOR_USERNAME: &str = "oathkeeper";
 
-pub fn router(state: AppState) -> Router {
+pub fn router(state: HydrateState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/internal/hydrate", post(hydrate))
@@ -44,12 +45,10 @@ pub struct OathkeeperSession {
 }
 
 async fn hydrate(
-    State(state): State<AppState>,
-    auth: Option<TypedHeader<Authorization<Basic>>>,
+    State(state): State<HydrateState>,
+    _: FromOathkeeper,
     AppJson(mut session): AppJson<OathkeeperSession>,
 ) -> Result<Json<OathkeeperSession>, AppError> {
-    check_credentials(auth, &state.hydrator_password)?;
-
     // Typed view of the parts we need; `&Value` is a serde Deserializer, so no clone.
     let kratos = KratosSession::deserialize(&session.extra)
         .map_err(|err| AppError::BadRequest(format!("extra is not a Kratos session: {err}")))?;
@@ -60,8 +59,8 @@ async fn hydrate(
         ));
     }
 
-    let user = db::find_or_create(&state.db, identity.id, &identity.traits.email).await?;
-    let roles = db::roles_of(&state.db, user.id).await?;
+    let UserWithRoles { user, roles } =
+        db::find_or_create(&state.db, identity.id, &identity.traits.email).await?;
     let profile = Profile {
         display_name: user.display_name.as_ref(),
         roles: &roles,
@@ -78,52 +77,64 @@ async fn hydrate(
     Ok(Json(session))
 }
 
-fn check_credentials(
-    auth: Option<TypedHeader<Authorization<Basic>>>,
-    password: &str,
-) -> Result<(), AppError> {
-    let Some(TypedHeader(Authorization(basic))) = auth else {
-        return Err(AppError::Unauthorized);
-    };
-    // Constant-time comparison: don't leak how much of the password matched.
-    let user_ok = basic
-        .username()
-        .as_bytes()
-        .ct_eq(HYDRATOR_USERNAME.as_bytes());
-    let password_ok = basic.password().as_bytes().ct_eq(password.as_bytes());
-    if (user_ok & password_ok).into() {
-        Ok(())
-    } else {
-        Err(AppError::Unauthorized)
+/// Extractor: the request carries the hydrator's Basic credentials. Axum runs extractors
+/// in argument order and the body extractor must come last, so this always rejects
+/// (401) before the body is read or parsed: callers without credentials learn nothing
+/// from parser errors.
+struct FromOathkeeper;
+
+impl FromRequestParts<HydrateState> for FromOathkeeper {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &HydrateState,
+    ) -> Result<Self, Self::Rejection> {
+        let TypedHeader(Authorization(basic)) =
+            TypedHeader::<Authorization<Basic>>::from_request_parts(parts, state)
+                .await
+                .map_err(|_| AppError::Unauthorized)?;
+        // Constant-time comparison: don't leak how much of the password matched.
+        let user_ok = basic
+            .username()
+            .as_bytes()
+            .ct_eq(HYDRATOR_USERNAME.as_bytes());
+        let password_ok = basic.password().as_bytes().ct_eq(state.password.as_bytes());
+        if (user_ok & password_ok).into() {
+            Ok(Self)
+        } else {
+            Err(AppError::Unauthorized)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use http_body_util::BodyExt;
     use serde_json::json;
     use sqlx::PgPool;
-    use tower::ServiceExt;
     use uuid::Uuid;
 
     use super::*;
-    use crate::auth::testing;
     use crate::models::Role;
 
     const PASSWORD: &str = "test-password";
 
     fn app(db: PgPool) -> Router {
-        router(AppState {
-            db,
-            verifier: Arc::new(testing::verifier()),
-            hydrator_password: PASSWORD.into(),
-        })
+        router(crate::testing::hydrate_state(db, PASSWORD))
+    }
+
+    fn request(body: String, password: Option<&str>) -> Request<Body> {
+        let mut req =
+            Request::post("/internal/hydrate").header(header::CONTENT_TYPE, "application/json");
+        if let Some(pw) = password {
+            let creds = STANDARD.encode(format!("{HYDRATOR_USERNAME}:{pw}"));
+            req = req.header(header::AUTHORIZATION, format!("Basic {creds}"));
+        }
+        req.body(Body::from(body)).unwrap()
     }
 
     /// The shape Oathkeeper sends: a real Kratos whoami response in `extra`.
@@ -148,22 +159,7 @@ mod tests {
     }
 
     async fn call(db: &PgPool, body: &Value, password: Option<&str>) -> (StatusCode, Value) {
-        let mut req =
-            Request::post("/internal/hydrate").header(header::CONTENT_TYPE, "application/json");
-        if let Some(pw) = password {
-            let creds = STANDARD.encode(format!("{HYDRATOR_USERNAME}:{pw}"));
-            req = req.header(header::AUTHORIZATION, format!("Basic {creds}"));
-        }
-        let res = app(db.clone())
-            .oneshot(req.body(Body::from(body.to_string())).unwrap())
-            .await
-            .unwrap();
-        let status = res.status();
-        let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+        crate::testing::send(app(db.clone()), request(body.to_string(), password)).await
     }
 
     #[sqlx::test]
@@ -211,6 +207,21 @@ mod tests {
             call(&db, &body, Some("wrong")).await.0,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[sqlx::test]
+    async fn checks_credentials_before_reading_the_body(db: PgPool) {
+        let garbage = |password: Option<&str>| request("{ not json".into(), password);
+
+        // Unauthenticated: 401 whatever the body, with no parser details.
+        for password in [None, Some("wrong")] {
+            let (status, _) = crate::testing::send(app(db.clone()), garbage(password)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        // Authenticated callers do get told about a bad body.
+        let (status, _) = crate::testing::send(app(db), garbage(Some(PASSWORD))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[sqlx::test]

@@ -1,12 +1,13 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
 /// Global role. Stored as text in `user_roles.role`, serialized lowercase in JSON and JWTs.
 ///
 /// Adding a variant also needs a migration that updates the `user_roles.role` check constraint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum Role {
@@ -32,17 +33,19 @@ impl fmt::Display for Role {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("unknown role {0:?} (expected one of: admin, user)")]
+#[error(
+    "unknown role {0:?} (expected one of: {expected})",
+    expected = Role::ALL.map(|role| role.as_str()).join(", ")
+)]
 pub struct UnknownRole(String);
 
 impl FromStr for Role {
     type Err = UnknownRole;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|role| role.as_str() == s)
-            .ok_or_else(|| UnknownRole(s.to_owned()))
+        // Reuse the serde derive so the accepted spellings can't drift from it.
+        Self::deserialize(IntoDeserializer::<serde::de::value::Error>::into_deserializer(s))
+            .map_err(|_| UnknownRole(s.to_owned()))
     }
 }
 
@@ -62,5 +65,9 @@ mod tests {
     fn rejects_unknown_roles() {
         assert!("superuser".parse::<Role>().is_err());
         assert!("Admin".parse::<Role>().is_err());
+        assert_eq!(
+            "x".parse::<Role>().unwrap_err().to_string(),
+            r#"unknown role "x" (expected one of: admin, user)"#
+        );
     }
 }
