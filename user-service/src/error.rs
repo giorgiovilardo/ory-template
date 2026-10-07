@@ -22,6 +22,8 @@ pub enum AppError {
     Unauthorized,
     #[error("not found")]
     NotFound,
+    #[error("request timed out")]
+    Timeout,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -36,6 +38,7 @@ impl IntoResponse for AppError {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+            Self::Timeout => (StatusCode::SERVICE_UNAVAILABLE, "timeout"),
             Self::Database(_) | Self::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }

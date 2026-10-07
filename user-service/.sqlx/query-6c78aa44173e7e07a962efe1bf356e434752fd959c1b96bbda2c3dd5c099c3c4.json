@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "with upserted as (\n               insert into users (id, email) values ($1, $2)\n               on conflict (id) do update set email = excluded.email, updated_at = now()\n               returning id, email, display_name, created_at, updated_at, (xmax = 0) as \"inserted!\"\n           ), granted as (\n               insert into user_roles (user_id, role)\n               select id, $3 from upserted where \"inserted!\"\n           )\n           select id as \"id!\", email as \"email!: Email\", display_name as \"display_name: DisplayName\",\n                  created_at as \"created_at!\", updated_at as \"updated_at!\",\n                  case when \"inserted!\" then array[$3]\n                       else array(select role from user_roles where user_id = upserted.id order by role)\n                  end as \"roles!: Vec<Role>\"\n           from upserted",
+  "query": "with updated as (\n               update users set display_name = $2 where id = $1\n               returning id, email, display_name, created_at, updated_at\n           )\n           select id, email as \"email: Email\", display_name as \"display_name: DisplayName\", created_at, updated_at,\n                  array(select role from user_roles where user_id = updated.id order by role) as \"roles!: Vec<Role>\"\n           from updated",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id!",
+        "name": "id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "email!: Email",
+        "name": "email: Email",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "created_at!",
+        "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -49,7 +49,7 @@
       },
       {
         "ordinal": 4,
-        "name": "updated_at!",
+        "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -68,7 +68,6 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Text",
         "Text"
       ]
     },
@@ -81,5 +80,5 @@
       null
     ]
   },
-  "hash": "560e4cc73835cb944da2e391e64429c17f2c1ebaebabe63f65883280e21898de"
+  "hash": "6c78aa44173e7e07a962efe1bf356e434752fd959c1b96bbda2c3dd5c099c3c4"
 }

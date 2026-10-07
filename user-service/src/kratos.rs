@@ -1,6 +1,7 @@
 //! What this service reads from Kratos. Only the fields we use are modeled; serde
 //! ignores the rest, so Kratos adding fields never breaks us.
 
+use reqwest::Url;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -40,8 +41,9 @@ pub async fn find_identity_by_email(
     admin_url: &str,
     email: &Email,
 ) -> anyhow::Result<Option<KratosIdentity>> {
+    let identities = format!("{admin_url}/admin/identities");
     let by_credentials: Vec<KratosIdentity> = http
-        .get(format!("{admin_url}/admin/identities"))
+        .get(&identities)
         .query(&[("credentials_identifier", email.as_ref())])
         .send()
         .await?
@@ -53,21 +55,15 @@ pub async fn find_identity_by_email(
     }
 
     let mut matches = Vec::new();
-    let mut page_token = None::<String>;
-    loop {
-        let mut request = http
-            .get(format!("{admin_url}/admin/identities"))
-            .query(&[("page_size", PAGE_SIZE)]);
-        if let Some(token) = &page_token {
-            request = request.query(&[("page_token", token)]);
-        }
-        let response = request.send().await?.error_for_status()?;
-        page_token = next_page_token(response.headers());
+    let mut next = Some(Url::parse_with_params(
+        &identities,
+        [("page_size", PAGE_SIZE)],
+    )?);
+    while let Some(url) = next {
+        let response = http.get(url.as_str()).send().await?.error_for_status()?;
+        next = next_page(&url, response.headers());
         let page: Vec<ListedIdentity> = response.json().await?;
         matches.extend(page.into_iter().filter_map(|listed| listed.matching(email)));
-        if page_token.is_none() {
-            break;
-        }
     }
 
     match matches.len() {
@@ -105,8 +101,9 @@ impl ListedIdentity {
     }
 }
 
-/// Kratos paginates with `Link: <...?page_token=X>; rel="next"`; the last page has no `next`.
-fn next_page_token(headers: &reqwest::header::HeaderMap) -> Option<String> {
+/// Kratos paginates with `Link: </admin/identities?...>; rel="next"` (relative to the
+/// current page); the last page has no `next`.
+fn next_page(current: &Url, headers: &reqwest::header::HeaderMap) -> Option<Url> {
     headers
         .get_all(reqwest::header::LINK)
         .iter()
@@ -114,12 +111,8 @@ fn next_page_token(headers: &reqwest::header::HeaderMap) -> Option<String> {
         .flat_map(|value| value.split(','))
         .filter(|link| link.contains("rel=\"next\""))
         .find_map(|link| {
-            let url = link.split_once('<')?.1.split_once('>')?.0;
-            let query = url.split_once('?')?.1;
-            query
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("page_token="))
-                .map(str::to_owned)
+            let target = link.split_once('<')?.1.split_once('>')?.0;
+            current.join(target).ok()
         })
 }
 
@@ -135,23 +128,29 @@ mod tests {
         headers
     }
 
+    fn current() -> Url {
+        Url::parse("http://kratos:4434/admin/identities?page_size=1").unwrap()
+    }
+
     #[test]
-    fn reads_the_next_page_token() {
+    fn follows_the_next_link() {
         let headers = link(
             "</admin/identities?page_size=1&page_token=00000000-0000-0000-0000-000000000000>; rel=\"first\",\
              </admin/identities?page_size=1&page_token=7ba28093-1c1a-4727-b664-bf2b842ca431>; rel=\"next\"",
         );
         assert_eq!(
-            next_page_token(&headers).as_deref(),
-            Some("7ba28093-1c1a-4727-b664-bf2b842ca431")
+            next_page(&current(), &headers).map(String::from).as_deref(),
+            Some(
+                "http://kratos:4434/admin/identities?page_size=1&page_token=7ba28093-1c1a-4727-b664-bf2b842ca431"
+            )
         );
     }
 
     #[test]
     fn last_page_has_no_next() {
         let headers = link("</admin/identities?page_size=1&page_token=0>; rel=\"first\"");
-        assert_eq!(next_page_token(&headers), None);
-        assert_eq!(next_page_token(&HeaderMap::new()), None);
+        assert_eq!(next_page(&current(), &headers), None);
+        assert_eq!(next_page(&current(), &HeaderMap::new()), None);
     }
 
     /// A Kratos admin API whose credentials index knows nobody (like a social-login-only
@@ -188,10 +187,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await });
-        url
+        crate::testing::spawn(app).await
     }
 
     #[tokio::test]

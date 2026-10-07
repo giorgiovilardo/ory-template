@@ -1,16 +1,27 @@
 //! Public API, reached only through Oathkeeper (`/api/users/**`), which has already
 //! authenticated the request and attached a JWT. Handlers just take `Claims`.
 
-use axum::extract::State;
+use std::sync::Arc;
+
+use axum::extract::{FromRef, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Deserializer, Serialize};
+use sqlx::PgPool;
+use time::OffsetDateTime;
+use uuid::Uuid;
 
-use crate::auth::Claims;
+use crate::auth::{Claims, JwtVerifier};
 use crate::db;
 use crate::error::{AppError, AppJson};
-use crate::models::{DisplayName, Role, User, UserWithRoles};
-use crate::state::ApiState;
+use crate::models::{DisplayName, Email, Role, User, UserWithRoles};
+
+/// What the public router needs: the database, and the verifier `Claims` extracts with.
+#[derive(Clone, FromRef)]
+pub struct ApiState {
+    pub db: PgPool,
+    pub verifier: Arc<JwtVerifier>,
+}
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
@@ -19,11 +30,39 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
+/// The `/api/users/me` body. Fields are listed, not `User` flattened, so a new column
+/// reaches clients only by decision (as `Profile` does for JWTs): the exhaustive
+/// destructuring in `from` stops compiling until the new field is placed or ignored.
 #[derive(Debug, Serialize)]
 struct MeResponse {
-    #[serde(flatten)]
-    user: User,
+    id: Uuid,
+    email: Email,
+    display_name: Option<DisplayName>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
     roles: Vec<Role>,
+}
+
+impl From<UserWithRoles> for MeResponse {
+    fn from(UserWithRoles { user, roles }: UserWithRoles) -> Self {
+        let User {
+            id,
+            email,
+            display_name,
+            created_at,
+            updated_at,
+        } = user;
+        Self {
+            id,
+            email,
+            display_name,
+            created_at,
+            updated_at,
+            roles,
+        }
+    }
 }
 
 async fn get_me(
@@ -41,6 +80,10 @@ async fn get_me(
 /// PATCH semantics: a missing field is left alone, `null` clears it.
 #[derive(Debug, Deserialize)]
 struct UpdateMe {
+    #[allow(
+        clippy::option_option,
+        reason = "absent / null / value is the PATCH contract"
+    )]
     #[serde(default, deserialize_with = "present")]
     display_name: Option<Option<String>>,
 }
@@ -66,12 +109,6 @@ async fn update_me(
     Ok(Json(found.ok_or(AppError::NotFound)?.into()))
 }
 
-impl From<UserWithRoles> for MeResponse {
-    fn from(UserWithRoles { user, roles }: UserWithRoles) -> Self {
-        Self { user, roles }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
@@ -81,7 +118,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::auth::testing;
+    use crate::testing;
 
     async fn call(
         db: &PgPool,
@@ -89,7 +126,10 @@ mod tests {
         token: Option<String>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let app = router(crate::testing::api_state(db.clone()));
+        let app = router(ApiState {
+            db: db.clone(),
+            verifier: Arc::new(testing::verifier()),
+        });
         let mut req = Request::builder().method(method).uri("/api/users/me");
         if let Some(token) = token {
             req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -100,12 +140,12 @@ mod tests {
                 .body(Body::from(b.to_string())),
             None => req.body(Body::empty()),
         };
-        crate::testing::send(app, req.unwrap()).await
+        testing::send(app, req.unwrap()).await
     }
 
     async fn existing_user(db: &PgPool) -> (Uuid, String) {
         let id = Uuid::new_v4();
-        db::find_or_create(db, id, &"ada@example.com".parse().unwrap())
+        db::sync_identity(db, &testing::identity(id, "ada@example.com"))
             .await
             .unwrap();
         (id, testing::token(json!({ "sub": id })))

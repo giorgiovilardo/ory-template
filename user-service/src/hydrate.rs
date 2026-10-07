@@ -1,35 +1,43 @@
 //! `POST /internal/hydrate`: called by Oathkeeper's hydrator mutator on every
 //! logged-in request, before it mints the JWT. Adds `extra.profile` to the session.
 //!
-//! Contract (Oathkeeper v26, pipeline/mutate/mutator_hydrator.go):
-//! - the body is the full AuthenticationSession: {subject, extra, header, match_context};
+//! Contract (Oathkeeper v26, `pipeline/mutate/mutator_hydrator.go`):
+//! - the body is the full `AuthenticationSession`: `{subject, extra, header, match_context}`;
 //! - the response REPLACES it, so everything must come back, untouched except `extra.profile`;
 //! - `subject` must not change, and any non-200 response fails the user's request;
 //! - Oathkeeper also forwards the original request headers (incl. the Kratos session
 //!   cookie), so never log request headers here.
 
+use std::sync::Arc;
+
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::{Json, Router};
 use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Basic;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
 use crate::db;
 use crate::error::{AppError, AppJson};
 use crate::kratos::KratosSession;
 use crate::models::{Profile, UserWithRoles};
-use crate::state::HydrateState;
 
 pub const HYDRATOR_USERNAME: &str = "oathkeeper";
 
+/// What the internal router needs: the database and the hydrator's Basic password.
+#[derive(Clone)]
+pub struct HydrateState {
+    pub db: PgPool,
+    pub password: Arc<str>,
+}
+
 pub fn router(state: HydrateState) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
         .route("/internal/hydrate", post(hydrate))
         .with_state(state)
 }
@@ -37,8 +45,9 @@ pub fn router(state: HydrateState) -> Router {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct OathkeeperSession {
     pub subject: String,
+    /// An object by type, so a malformed session is rejected before any database write.
     #[serde(default)]
-    pub extra: Value,
+    pub extra: Map<String, Value>,
     /// `header`, `match_context` and anything Oathkeeper adds later: passed through as-is.
     #[serde(flatten)]
     pub rest: Map<String, Value>,
@@ -49,7 +58,7 @@ async fn hydrate(
     _: FromOathkeeper,
     AppJson(mut session): AppJson<OathkeeperSession>,
 ) -> Result<Json<OathkeeperSession>, AppError> {
-    // Typed view of the parts we need; `&Value` is a serde Deserializer, so no clone.
+    // Typed view of the parts we need; `&Map` is a serde Deserializer, so no clone.
     let kratos = KratosSession::deserialize(&session.extra)
         .map_err(|err| AppError::BadRequest(format!("extra is not a Kratos session: {err}")))?;
     let identity = kratos.identity;
@@ -59,21 +68,14 @@ async fn hydrate(
         ));
     }
 
-    let UserWithRoles { user, roles } =
-        db::find_or_create(&state.db, identity.id, &identity.traits.email).await?;
+    let UserWithRoles { user, roles } = db::sync_identity(&state.db, &identity).await?;
     let profile = Profile {
         display_name: user.display_name.as_ref(),
         roles: &roles,
     };
 
-    session
-        .extra
-        .as_object_mut()
-        .ok_or_else(|| AppError::BadRequest("extra is not an object".into()))?
-        .insert(
-            "profile".into(),
-            serde_json::to_value(profile).map_err(anyhow::Error::from)?,
-        );
+    // `json!` unwraps internally: serializing `Profile` (strings and enums) can't fail.
+    session.extra.insert("profile".into(), json!(profile));
     Ok(Json(session))
 }
 
@@ -124,7 +126,10 @@ mod tests {
     const PASSWORD: &str = "test-password";
 
     fn app(db: PgPool) -> Router {
-        router(crate::testing::hydrate_state(db, PASSWORD))
+        router(HydrateState {
+            db,
+            password: PASSWORD.into(),
+        })
     }
 
     fn request(body: String, password: Option<&str>) -> Request<Body> {
@@ -190,7 +195,7 @@ mod tests {
     async fn reflects_current_roles(db: PgPool) {
         let id = Uuid::new_v4();
         call(&db, &session(id, "ada@example.com"), Some(PASSWORD)).await;
-        db::grant_role(&db, id, Role::Admin, None).await.unwrap();
+        db::grant_role(&db, id, Role::Admin).await.unwrap();
 
         let (_, output) = call(&db, &session(id, "ada@example.com"), Some(PASSWORD)).await;
         assert_eq!(

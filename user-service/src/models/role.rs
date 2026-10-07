@@ -18,7 +18,7 @@ pub enum Role {
 impl Role {
     pub const ALL: [Role; 2] = [Role::Admin, Role::User];
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Admin => "admin",
             Self::User => "user",
@@ -35,7 +35,7 @@ impl fmt::Display for Role {
 #[derive(Debug, thiserror::Error)]
 #[error(
     "unknown role {0:?} (expected one of: {expected})",
-    expected = Role::ALL.map(|role| role.as_str()).join(", ")
+    expected = Role::ALL.map(Role::as_str).join(", ")
 )]
 pub struct UnknownRole(String);
 

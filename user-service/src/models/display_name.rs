@@ -20,7 +20,7 @@ pub enum DisplayNameError {
 
 impl DisplayNameError {
     /// Stable machine-readable code for API responses.
-    pub fn code(&self) -> &'static str {
+    pub fn code(self) -> &'static str {
         match self {
             Self::Empty => "display_name_empty",
             Self::TooLong => "display_name_too_long",

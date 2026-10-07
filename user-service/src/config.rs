@@ -1,70 +1,80 @@
-use std::env;
+//! Settings shared by the subcommands, as clap argument groups: each subcommand
+//! flattens in exactly the ones it needs. Every setting is a flag that falls back to
+//! an environment variable (the flag wins), and `--help` lists both. Secrets have their
+//! values hidden from `--help`.
+
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::Context;
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use clap::Args;
 
-const DEFAULT_PUBLIC_ADDR: &str = "0.0.0.0:3000";
-const DEFAULT_INTERNAL_ADDR: &str = "0.0.0.0:3001";
-const DEFAULT_KRATOS_ADMIN_URL: &str = "http://kratos:4434";
+#[derive(Args)]
+pub struct Database {
+    #[arg(
+        id = "database_url",
+        value_name = "URL",
+        long = "database-url",
+        env = "DATABASE_URL",
+        hide_env_values = true
+    )]
+    pub url: String,
+    /// Connection pool size.
+    #[arg(
+        id = "db_max_connections",
+        value_name = "N",
+        long = "db-max-connections",
+        env = "DB_MAX_CONNECTIONS",
+        default_value_t = 10
+    )]
+    pub max_connections: u32,
+}
 
-pub struct Config {
-    pub database_url: String,
-    /// Basic-auth password Oathkeeper uses for `/internal/hydrate`.
-    pub hydrator_password: String,
-    pub jwks_url: String,
-    pub jwt_issuer: String,
+#[derive(Args)]
+pub struct KratosAdmin {
+    #[arg(
+        id = "kratos_admin_url",
+        value_name = "URL",
+        long = "kratos-admin-url",
+        env = "KRATOS_ADMIN_URL",
+        default_value = "http://kratos:4434"
+    )]
+    pub url: String,
+}
+
+/// Shared with `healthcheck`, which probes it.
+#[derive(Args)]
+pub struct PublicAddr {
     /// Routed through Oathkeeper: `/api/users/**`.
-    pub public_addr: SocketAddr,
+    #[arg(
+        id = "public_addr",
+        value_name = "ADDR",
+        long = "public-addr",
+        env = "PUBLIC_ADDR",
+        default_value = "0.0.0.0:3000"
+    )]
+    pub addr: SocketAddr,
+}
+
+#[derive(Args)]
+pub struct ServeConfig {
+    #[command(flatten)]
+    pub database: Database,
+    /// Basic-auth password Oathkeeper uses for `/internal/hydrate`.
+    #[arg(long, env = "HYDRATOR_PASSWORD", hide_env_values = true)]
+    pub hydrator_password: String,
+    #[arg(
+        long,
+        env = "JWKS_URL",
+        default_value = "http://oathkeeper:4456/.well-known/jwks.json"
+    )]
+    pub jwks_url: String,
+    #[arg(long, env = "JWT_ISSUER", default_value = "http://localhost:8080/")]
+    pub jwt_issuer: String,
+    #[command(flatten)]
+    pub public: PublicAddr,
     /// Never routed through Oathkeeper: `/internal/hydrate`.
+    #[arg(long, env = "INTERNAL_ADDR", default_value = "0.0.0.0:3001")]
     pub internal_addr: SocketAddr,
-}
-
-impl Config {
-    pub fn from_env() -> anyhow::Result<Self> {
-        Ok(Self {
-            database_url: required("DATABASE_URL")?,
-            hydrator_password: required("HYDRATOR_PASSWORD")?,
-            jwks_url: optional("JWKS_URL", "http://oathkeeper:4456/.well-known/jwks.json"),
-            jwt_issuer: optional("JWT_ISSUER", "http://localhost:8080/"),
-            public_addr: public_addr()?,
-            internal_addr: socket_addr("INTERNAL_ADDR", DEFAULT_INTERNAL_ADDR)?,
-        })
-    }
-}
-
-pub fn required(name: &str) -> anyhow::Result<String> {
-    env::var(name).with_context(|| format!("missing environment variable {name}"))
-}
-
-pub fn optional(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_owned())
-}
-
-fn socket_addr(name: &str, default: &str) -> anyhow::Result<SocketAddr> {
-    let raw = optional(name, default);
-    raw.parse()
-        .with_context(|| format!("{name} must be an ip:port address, got {raw:?}"))
-}
-
-/// Shared with `healthcheck`, which only needs the port.
-pub fn public_addr() -> anyhow::Result<SocketAddr> {
-    socket_addr("PUBLIC_ADDR", DEFAULT_PUBLIC_ADDR)
-}
-
-pub fn kratos_admin_url() -> String {
-    optional("KRATOS_ADMIN_URL", DEFAULT_KRATOS_ADMIN_URL)
-}
-
-pub async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
-    PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(database_url)
-        .await
-        .context("connecting to the database")
 }
 
 pub fn http_client() -> anyhow::Result<reqwest::Client> {

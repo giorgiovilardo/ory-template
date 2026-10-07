@@ -9,3 +9,14 @@ create table users (
     created_at   timestamptz not null default now(),
     updated_at   timestamptz not null default now()
 );
+
+-- Bumps `users.updated_at` on every update, so no statement (or manual fix) can forget to.
+create function set_updated_at() returns trigger language plpgsql as $$
+begin
+    new.updated_at = now();
+    return new;
+end
+$$;
+
+create trigger users_set_updated_at before update on users
+    for each row execute function set_updated_at();

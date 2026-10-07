@@ -7,10 +7,51 @@
 //! validated by their types; values read back are trusted (`#[sqlx(transparent)]`),
 //! since only validated values are ever written.
 
+use std::time::Duration;
+
+use anyhow::Context;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::config::Database;
+use crate::kratos::KratosIdentity;
 use crate::models::{DisplayName, Email, Role, User, UserWithRoles};
+
+pub async fn connect(database: &Database) -> anyhow::Result<PgPool> {
+    PgPoolOptions::new()
+        .max_connections(database.max_connections)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&database.url)
+        .await
+        .context("connecting to the database")
+}
+
+/// The flat shape every user-with-roles query selects, so the mapping lives in one place.
+struct UserWithRolesRow {
+    id: Uuid,
+    email: Email,
+    display_name: Option<DisplayName>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+    roles: Vec<Role>,
+}
+
+impl From<UserWithRolesRow> for UserWithRoles {
+    fn from(row: UserWithRolesRow) -> Self {
+        Self {
+            user: User {
+                id: row.id,
+                email: row.email,
+                display_name: row.display_name,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            },
+            roles: row.roles,
+        }
+    }
+}
 
 pub async fn find_by_id(db: &PgPool, id: Uuid) -> sqlx::Result<Option<User>> {
     sqlx::query_as!(
@@ -25,30 +66,24 @@ pub async fn find_by_id(db: &PgPool, id: Uuid) -> sqlx::Result<Option<User>> {
 
 /// The user and their roles in one query (a single snapshot, one round trip).
 pub async fn find_with_roles(db: &PgPool, id: Uuid) -> sqlx::Result<Option<UserWithRoles>> {
-    let row = sqlx::query!(
+    sqlx::query_as!(
+        UserWithRolesRow,
         r#"select id, email as "email: Email", display_name as "display_name: DisplayName", created_at, updated_at,
                   array(select role from user_roles where user_id = users.id order by role) as "roles!: Vec<Role>"
            from users where id = $1"#,
         id
     )
     .fetch_optional(db)
-    .await?;
-    Ok(row.map(|row| UserWithRoles {
-        user: User {
-            id: row.id,
-            email: row.email,
-            display_name: row.display_name,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        },
-        roles: row.roles,
-    }))
+    .await
+    .map(|row| row.map(Into::into))
 }
 
-/// Returns the user and their roles, creating the user (with the `user` role) on first
-/// sight and refreshing the email copy when Kratos' differs. The common case is one
-/// SELECT and no write; a miss or an email change takes one more statement.
-pub async fn find_or_create(db: &PgPool, id: Uuid, email: &Email) -> sqlx::Result<UserWithRoles> {
+/// Brings our copy in line with the Kratos identity, the source of truth, and returns the
+/// user and their roles: creates the user (with the `user` role) on first sight and
+/// refreshes the email copy when Kratos' differs. The common case is one SELECT and no
+/// write; a miss or an email change takes one more statement.
+pub async fn sync_identity(db: &PgPool, identity: &KratosIdentity) -> sqlx::Result<UserWithRoles> {
+    let (id, email) = (identity.id, &identity.traits.email);
     if let Some(found) = find_with_roles(db, id).await?
         && &found.user.email == email
     {
@@ -63,10 +98,11 @@ pub async fn find_or_create(db: &PgPool, id: Uuid, email: &Email) -> sqlx::Resul
 /// so a refresh never restores a revoked `user` role. Roles are not read back for that
 /// case: a CTE can't see rows written by its siblings, and a new user has just the one.
 async fn upsert(db: &PgPool, id: Uuid, email: &Email) -> sqlx::Result<UserWithRoles> {
-    let row = sqlx::query!(
+    sqlx::query_as!(
+        UserWithRolesRow,
         r#"with upserted as (
                insert into users (id, email) values ($1, $2)
-               on conflict (id) do update set email = excluded.email, updated_at = now()
+               on conflict (id) do update set email = excluded.email
                returning id, email, display_name, created_at, updated_at, (xmax = 0) as "inserted!"
            ), granted as (
                insert into user_roles (user_id, role)
@@ -83,17 +119,8 @@ async fn upsert(db: &PgPool, id: Uuid, email: &Email) -> sqlx::Result<UserWithRo
         Role::User as Role
     )
     .fetch_one(db)
-    .await?;
-    Ok(UserWithRoles {
-        user: User {
-            id: row.id,
-            email: row.email,
-            display_name: row.display_name,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        },
-        roles: row.roles,
-    })
+    .await
+    .map(Into::into)
 }
 
 pub async fn roles_of(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<Role>> {
@@ -112,9 +139,10 @@ pub async fn set_display_name(
     id: Uuid,
     name: Option<&DisplayName>,
 ) -> sqlx::Result<Option<UserWithRoles>> {
-    let row = sqlx::query!(
+    sqlx::query_as!(
+        UserWithRolesRow,
         r#"with updated as (
-               update users set display_name = $2, updated_at = now() where id = $1
+               update users set display_name = $2 where id = $1
                returning id, email, display_name, created_at, updated_at
            )
            select id, email as "email: Email", display_name as "display_name: DisplayName", created_at, updated_at,
@@ -124,32 +152,17 @@ pub async fn set_display_name(
         name as Option<&DisplayName>
     )
     .fetch_optional(db)
-    .await?;
-    Ok(row.map(|row| UserWithRoles {
-        user: User {
-            id: row.id,
-            email: row.email,
-            display_name: row.display_name,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        },
-        roles: row.roles,
-    }))
+    .await
+    .map(|row| row.map(Into::into))
 }
 
 /// Returns false if the user already had the role.
-pub async fn grant_role(
-    db: &PgPool,
-    id: Uuid,
-    role: Role,
-    granted_by: Option<Uuid>,
-) -> sqlx::Result<bool> {
+pub async fn grant_role(db: &PgPool, id: Uuid, role: Role) -> sqlx::Result<bool> {
     let result = sqlx::query!(
-        "insert into user_roles (user_id, role, granted_by) values ($1, $2, $3)
+        "insert into user_roles (user_id, role) values ($1, $2)
          on conflict (user_id, role) do nothing",
         id,
-        role as Role,
-        granted_by
+        role as Role
     )
     .execute(db)
     .await?;
@@ -179,6 +192,7 @@ pub async fn delete_user(db: &PgPool, id: Uuid) -> sqlx::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::identity;
 
     fn email(s: &str) -> Email {
         s.parse().unwrap()
@@ -187,10 +201,10 @@ mod tests {
     #[sqlx::test]
     async fn creates_user_with_default_role_once(db: PgPool) {
         let id = Uuid::new_v4();
-        let first = find_or_create(&db, id, &email("ada@example.com"))
+        let first = sync_identity(&db, &identity(id, "ada@example.com"))
             .await
             .unwrap();
-        let second = find_or_create(&db, id, &email("ada@example.com"))
+        let second = sync_identity(&db, &identity(id, "ada@example.com"))
             .await
             .unwrap();
 
@@ -203,27 +217,27 @@ mod tests {
     #[sqlx::test]
     async fn refreshes_changed_email(db: PgPool) {
         let id = Uuid::new_v4();
-        find_or_create(&db, id, &email("old@example.com"))
+        let before = sync_identity(&db, &identity(id, "old@example.com"))
             .await
             .unwrap();
-        grant_role(&db, id, Role::Admin, None).await.unwrap();
-        let found = find_or_create(&db, id, &email("new@example.com"))
+        grant_role(&db, id, Role::Admin).await.unwrap();
+        let found = sync_identity(&db, &identity(id, "new@example.com"))
             .await
             .unwrap();
 
         assert_eq!(found.user.email, email("new@example.com"));
-        assert!(found.user.updated_at >= found.user.created_at);
+        assert!(found.user.updated_at > before.user.updated_at);
         assert_eq!(found.roles, vec![Role::Admin, Role::User]);
     }
 
     #[sqlx::test]
     async fn refreshing_the_email_keeps_revoked_roles_revoked(db: PgPool) {
         let id = Uuid::new_v4();
-        find_or_create(&db, id, &email("old@example.com"))
+        sync_identity(&db, &identity(id, "old@example.com"))
             .await
             .unwrap();
         revoke_role(&db, id, Role::User).await.unwrap();
-        let found = find_or_create(&db, id, &email("new@example.com"))
+        let found = sync_identity(&db, &identity(id, "new@example.com"))
             .await
             .unwrap();
 
@@ -234,8 +248,8 @@ mod tests {
     #[sqlx::test]
     async fn concurrent_first_requests_create_one_user(db: PgPool) {
         let id = Uuid::new_v4();
-        let e = email("ada@example.com");
-        let (a, b) = tokio::join!(find_or_create(&db, id, &e), find_or_create(&db, id, &e));
+        let ada = identity(id, "ada@example.com");
+        let (a, b) = tokio::join!(sync_identity(&db, &ada), sync_identity(&db, &ada));
 
         assert_eq!(a.unwrap().user.id, b.unwrap().user.id);
         assert_eq!(roles_of(&db, id).await.unwrap(), vec![Role::User]);
@@ -243,16 +257,16 @@ mod tests {
 
     #[sqlx::test]
     async fn survives_the_user_being_deleted_mid_refresh(db: PgPool) {
-        // forget-user can delete the row between find_or_create's SELECT and UPDATE.
+        // forget-user can delete the row between sync_identity's SELECT and UPDATE.
         // Interleaving is down to scheduling, so run enough rounds to hit it.
         let id = Uuid::new_v4();
         for round in 0..300 {
-            find_or_create(&db, id, &email(&format!("old{round}@example.com")))
+            sync_identity(&db, &identity(id, &format!("old{round}@example.com")))
                 .await
                 .unwrap();
-            let new = email(&format!("new{round}@example.com"));
-            let (found, _) = tokio::join!(find_or_create(&db, id, &new), delete_user(&db, id));
-            assert_eq!(found.unwrap().user.email, new, "round {round}");
+            let new = identity(id, &format!("new{round}@example.com"));
+            let (found, _) = tokio::join!(sync_identity(&db, &new), delete_user(&db, id));
+            assert_eq!(found.unwrap().user.email, new.traits.email, "round {round}");
         }
     }
 
@@ -261,10 +275,10 @@ mod tests {
         let id = Uuid::new_v4();
         assert_eq!(find_with_roles(&db, id).await.unwrap(), None);
 
-        find_or_create(&db, id, &email("ada@example.com"))
+        sync_identity(&db, &identity(id, "ada@example.com"))
             .await
             .unwrap();
-        grant_role(&db, id, Role::Admin, None).await.unwrap();
+        grant_role(&db, id, Role::Admin).await.unwrap();
         let found = find_with_roles(&db, id).await.unwrap().unwrap();
         assert_eq!(found.roles, vec![Role::Admin, Role::User]);
 
@@ -277,12 +291,12 @@ mod tests {
     #[sqlx::test]
     async fn grants_and_revokes_roles(db: PgPool) {
         let id = Uuid::new_v4();
-        find_or_create(&db, id, &email("ada@example.com"))
+        sync_identity(&db, &identity(id, "ada@example.com"))
             .await
             .unwrap();
 
-        assert!(grant_role(&db, id, Role::Admin, None).await.unwrap());
-        assert!(!grant_role(&db, id, Role::Admin, None).await.unwrap());
+        assert!(grant_role(&db, id, Role::Admin).await.unwrap());
+        assert!(!grant_role(&db, id, Role::Admin).await.unwrap());
         assert_eq!(
             roles_of(&db, id).await.unwrap(),
             vec![Role::Admin, Role::User]
@@ -296,7 +310,7 @@ mod tests {
     #[sqlx::test]
     async fn sets_and_clears_display_name(db: PgPool) {
         let id = Uuid::new_v4();
-        find_or_create(&db, id, &email("ada@example.com"))
+        sync_identity(&db, &identity(id, "ada@example.com"))
             .await
             .unwrap();
         let name = DisplayName::try_from("Ada".to_owned()).unwrap();
@@ -320,7 +334,7 @@ mod tests {
     #[sqlx::test]
     async fn deleting_a_user_removes_their_roles(db: PgPool) {
         let id = Uuid::new_v4();
-        find_or_create(&db, id, &email("ada@example.com"))
+        sync_identity(&db, &identity(id, "ada@example.com"))
             .await
             .unwrap();
 

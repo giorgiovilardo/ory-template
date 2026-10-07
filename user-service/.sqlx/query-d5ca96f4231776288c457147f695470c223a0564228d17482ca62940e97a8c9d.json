@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into user_roles (user_id, role) values ($1, $2)\n         on conflict (user_id, role) do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d5ca96f4231776288c457147f695470c223a0564228d17482ca62940e97a8c9d"
+}

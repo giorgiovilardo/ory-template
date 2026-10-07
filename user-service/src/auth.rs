@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRef, FromRequestParts};
 use axum::http::request::Parts;
 use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
@@ -18,7 +18,6 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::state::ApiState;
 
 /// After a successful fetch, unknown key ids trigger another at most this often (key
 /// rotation support without letting garbage tokens hammer Oathkeeper).
@@ -68,9 +67,9 @@ struct RemoteJwks {
 
 impl JwtVerifier {
     /// Keys are fetched from `jwks_url` on first use and refetched on unknown key ids.
-    pub fn remote(jwks_url: String, issuer: String, http: reqwest::Client) -> Self {
+    pub fn remote(jwks_url: String, issuer: &str, http: reqwest::Client) -> Self {
         Self {
-            validation: validation(&issuer),
+            validation: validation(issuer),
             keys: RwLock::new(HashMap::new()),
             remote: Some(RemoteJwks {
                 url: jwks_url,
@@ -82,10 +81,10 @@ impl JwtVerifier {
 
     /// Fixed keys, no network. For tests.
     #[cfg(test)]
-    pub fn from_jwks(keys: JwkSet, issuer: String) -> Self {
+    pub fn from_jwks(keys: &JwkSet, issuer: &str) -> Self {
         Self {
-            validation: validation(&issuer),
-            keys: RwLock::new(decoding_keys(&keys)),
+            validation: validation(issuer),
+            keys: RwLock::new(decoding_keys(keys)),
             remote: None,
         }
     }
@@ -98,33 +97,32 @@ impl JwtVerifier {
     }
 
     async fn key_for(&self, kid: &str) -> Result<Arc<DecodingKey>, AuthError> {
+        let unknown = || AuthError::UnknownKey(kid.to_owned());
         if let Some(key) = self.cached_key(kid) {
             return Ok(key);
         }
-        if let Some(remote) = &self.remote {
-            let mut next_fetch = remote.next_fetch.lock().await;
-            // The fetch we queued behind may have brought the key.
-            if let Some(key) = self.cached_key(kid) {
-                return Ok(key);
-            }
-            if next_fetch.is_none_or(|at| Instant::now() >= at) {
-                // Only schedule the next fetch once this one has finished, and sooner
-                // if it failed: a failure must not lock everyone out for the full interval.
-                let fetched = remote.fetch().await;
-                let wait = if fetched.is_ok() {
-                    MIN_REFRESH_INTERVAL
-                } else {
-                    RETRY_AFTER_FAILURE
-                };
-                *next_fetch = Some(Instant::now() + wait);
-                let fresh = fetched?;
-                *self.keys.write().expect("jwks lock poisoned") = decoding_keys(&fresh);
-                if let Some(key) = self.cached_key(kid) {
-                    return Ok(key);
-                }
-            }
+        let Some(remote) = &self.remote else {
+            return Err(unknown());
+        };
+        let mut next_fetch = remote.next_fetch.lock().await;
+        // The fetch we queued behind may have brought the key.
+        if let Some(key) = self.cached_key(kid) {
+            return Ok(key);
         }
-        Err(AuthError::UnknownKey(kid.to_owned()))
+        if next_fetch.is_some_and(|at| Instant::now() < at) {
+            return Err(unknown());
+        }
+        // Only schedule the next fetch once this one has finished, and sooner if it
+        // failed: a failure must not lock everyone out for the full interval.
+        let fetched = remote.fetch().await;
+        let wait = if fetched.is_ok() {
+            MIN_REFRESH_INTERVAL
+        } else {
+            RETRY_AFTER_FAILURE
+        };
+        *next_fetch = Some(Instant::now() + wait);
+        *self.keys.write().expect("jwks lock poisoned") = decoding_keys(&fetched?);
+        self.cached_key(kid).ok_or_else(unknown)
     }
 
     fn cached_key(&self, kid: &str) -> Option<Arc<DecodingKey>> {
@@ -174,65 +172,24 @@ impl RemoteJwks {
 }
 
 /// Extractor: add `claims: Claims` to a handler's arguments to require a valid JWT.
-impl FromRequestParts<ApiState> for Claims {
+/// Works with any router state that provides the verifier (`#[derive(FromRef)]`).
+impl<S> FromRequestParts<S> for Claims
+where
+    Arc<JwtVerifier>: FromRef<S>,
+    S: Send + Sync,
+{
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &ApiState,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let TypedHeader(Authorization(bearer)) =
             TypedHeader::<Authorization<Bearer>>::from_request_parts(parts, state)
                 .await
                 .map_err(|_| AppError::Unauthorized)?;
-        state.verifier.verify(bearer.token()).await.map_err(|err| {
+        let verifier = Arc::<JwtVerifier>::from_ref(state);
+        verifier.verify(bearer.token()).await.map_err(|err| {
             tracing::debug!(%err, "rejected token");
             AppError::Unauthorized
         })
-    }
-}
-
-/// Test helpers: a fixed Ed25519 key pair, so tests can mint "real" tokens offline.
-#[cfg(test)]
-pub mod testing {
-    use jsonwebtoken::{EncodingKey, Header, encode};
-    use serde_json::json;
-
-    use super::*;
-
-    pub const ISSUER: &str = "http://localhost:8080/";
-    pub const KID: &str = "test-key";
-    const PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIKv/ABhOfUH9W6xjz45q8YcU5EutEPsyUxood02hq03C
------END PRIVATE KEY-----";
-    const PUBLIC_X: &str = "uIY7GvdnKS8istVWUhwYskS2H0lVw3T_acQ7DvSvT3Q";
-
-    pub fn jwks() -> serde_json::Value {
-        json!({
-            "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": PUBLIC_X, "kid": KID, "alg": "EdDSA", "use": "sig" }]
-        })
-    }
-
-    pub fn verifier() -> JwtVerifier {
-        JwtVerifier::from_jwks(serde_json::from_value(jwks()).unwrap(), ISSUER.to_owned())
-    }
-
-    /// Signs `claims` with the test key, merged over sensible defaults.
-    pub fn token(claims: serde_json::Value) -> String {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut body = json!({ "iss": ISSUER, "sub": uuid::Uuid::new_v4(), "iat": now, "exp": now + 60, "roles": ["user"] });
-        body.as_object_mut()
-            .unwrap()
-            .extend(claims.as_object().unwrap().clone());
-
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some(KID.to_owned());
-        encode(
-            &header,
-            &body,
-            &EncodingKey::from_ed_pem(PRIVATE_PEM.as_bytes()).unwrap(),
-        )
-        .unwrap()
     }
 }
 
@@ -246,8 +203,8 @@ mod tests {
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde_json::json;
 
-    use super::testing::*;
     use super::*;
+    use crate::testing::*;
 
     #[tokio::test]
     async fn accepts_valid_tokens() {
@@ -277,9 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unknown_key_ids() {
-        let mut parts: Vec<String> = token(json!({})).split('.').map(str::to_owned).collect();
-        parts[0] = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","kid":"other"}"#);
-        let result = verifier().verify(&parts.join(".")).await;
+        let result = verifier().verify(&token_with_kid("other")).await;
         assert!(matches!(result, Err(AuthError::UnknownKey(k)) if k == "other"));
     }
 
@@ -291,7 +246,7 @@ mod tests {
         let forged = encode(
             &header,
             &json!({ "iss": ISSUER, "sub": Uuid::new_v4(), "exp": 9_999_999_999u64 }),
-            &EncodingKey::from_secret(b"uIY7GvdnKS8istVWUhwYskS2H0lVw3T_acQ7DvSvT3Q"),
+            &EncodingKey::from_secret(PUBLIC_X.as_bytes()),
         )
         .unwrap();
         assert!(verifier().verify(&forged).await.is_err());
@@ -331,19 +286,13 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/jwks", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await });
+        let url = format!("{}/jwks", crate::testing::spawn(app).await);
         JwksServer { url, hits, failing }
     }
 
     fn remote_verifier(server: &JwksServer) -> JwtVerifier {
         // No client timeout: it would race the paused test clock.
-        JwtVerifier::remote(
-            server.url.clone(),
-            ISSUER.to_owned(),
-            reqwest::Client::new(),
-        )
+        JwtVerifier::remote(server.url.clone(), ISSUER, reqwest::Client::new())
     }
 
     #[tokio::test(start_paused = true)]
@@ -403,9 +352,7 @@ mod tests {
     async fn unknown_key_ids_refetch_at_most_once_per_interval() {
         let server = serve_jwks().await;
         let verifier = remote_verifier(&server);
-        let mut parts: Vec<String> = token(json!({})).split('.').map(str::to_owned).collect();
-        parts[0] = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","kid":"other"}"#);
-        let unknown = parts.join(".");
+        let unknown = token_with_kid("other");
 
         for _ in 0..3 {
             assert!(matches!(

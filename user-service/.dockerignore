@@ -2,3 +2,7 @@ target
 .idea
 .git
 .env
+Dockerfile
+.dockerignore
+.gitignore
+.env.example
