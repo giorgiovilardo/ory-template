@@ -1,0 +1,29 @@
+[package]
+name = "user-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["macros"] }
+axum-extra = { version = "0.12.6", features = ["typed-header"] }
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", features = ["postgres", "runtime-tokio", "uuid", "time"] }
+subtle = "2.6.1"
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["formatting", "parsing", "serde"] }
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.27.0", features = ["serde"] }
+
+[dev-dependencies]
+base64 = "0.23.1"
+http-body-util = "0.1.5"
+tokio = { version = "1.53.2", features = ["test-util"] }
+tower = { version = "0.5.3", features = ["util"] }
+uuid = { version = "1.27.0", features = ["v4"] }
