@@ -41,11 +41,32 @@ def call(method, path, body=None, base=ADMIN, headers=None):
         sys.exit(f"error: {method} {path} -> {e.code}: {detail}")
 
 
+def all_identities():
+    """Every identity, following Kratos' `Link: <...>; rel="next"` pagination."""
+    rows, path = [], "/admin/identities?page_size=250"
+    while path:
+        page, headers = call("GET", path)
+        rows += page
+        nxt = re.search(r'<[^>]*(/admin/identities\?[^>]*)>; rel="next"', headers.get("Link") or "")
+        path = nxt.group(1) if nxt and page else None
+    return rows
+
+
 def find(email):
+    """Same lookup as user-service's `kratos::find_identity_by_email`. The credentials index
+    is one cheap request but only knows login identifiers, so it misses identities that
+    signed up only through Google/GitHub; on a miss, scan every identity's `traits.email`.
+    Refuses to pick when several identities share the email."""
     users, _ = call("GET", f"/admin/identities?credentials_identifier={urllib.request.quote(email)}")
-    if not users:
+    if users:
+        return users[0]
+    wanted = email.strip().lower()
+    matches = [u for u in all_identities() if (u["traits"].get("email") or "").strip().lower() == wanted]
+    if not matches:
         sys.exit(f"error: no user with email {email}")
-    return users[0]
+    if len(matches) > 1:
+        sys.exit(f"error: several users have the email {email}: {', '.join(u['id'] for u in matches)}")
+    return matches[0]
 
 
 def identity_id(email):
@@ -54,12 +75,7 @@ def identity_id(email):
 
 
 def users():
-    rows, path = [], "/admin/identities?page_size=250"
-    while path:
-        page, headers = call("GET", path)
-        rows += page
-        nxt = re.search(r'<[^>]*(/admin/identities\?[^>]*)>; rel="next"', headers.get("Link") or "")
-        path = nxt.group(1) if nxt and page else None
+    rows = all_identities()
     print(f"{'ID':36}  {'EMAIL':32}  {'STATE':8}  {'VERIFIED':8}  CREATED")
     for u in rows:
         verified = any(a["verified"] for a in u.get("verifiable_addresses", []))
