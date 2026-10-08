@@ -25,7 +25,7 @@ pub struct ApiState {
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/health", get(|| async { "ok" }))
         .route("/api/users/me", get(get_me).put(update_me))
         .with_state(state)
 }

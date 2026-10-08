@@ -32,7 +32,7 @@ pub enum Command {
         #[command(flatten)]
         database: Database,
     },
-    /// Exit 0 if the local server answers `/healthz` (the image has no curl).
+    /// Exit 0 if the local server answers `/health` (the image has no curl).
     Healthcheck {
         #[command(flatten)]
         public: PublicAddr,
@@ -213,7 +213,7 @@ async fn forget_user(
 async fn healthcheck(public: &PublicAddr) -> anyhow::Result<()> {
     let port = public.addr.port();
     let res = config::http_client()?
-        .get(format!("http://127.0.0.1:{port}/healthz"))
+        .get(format!("http://127.0.0.1:{port}/health"))
         .send()
         .await?;
     if !res.status().is_success() {
