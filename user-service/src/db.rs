@@ -132,6 +132,20 @@ pub async fn roles_of(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<Role>> {
     .await
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the admin API (next commit) uses it")
+)]
+pub async fn has_role(db: &PgPool, id: Uuid, role: Role) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
+        r#"select exists (select 1 from user_roles where user_id = $1 and role = $2) as "exists!""#,
+        id,
+        role as Role
+    )
+    .fetch_one(db)
+    .await
+}
+
 /// The users among `ids` that have a row, with their roles, in one query (for listings).
 /// Ids without a row (no data yet) are simply absent.
 pub async fn find_many_with_roles(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<UserWithRoles>> {
@@ -310,8 +324,10 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(!has_role(&db, id, Role::Admin).await.unwrap());
         assert!(grant_role(&db, id, Role::Admin).await.unwrap());
         assert!(!grant_role(&db, id, Role::Admin).await.unwrap());
+        assert!(has_role(&db, id, Role::Admin).await.unwrap());
         assert_eq!(
             roles_of(&db, id).await.unwrap(),
             vec![Role::Admin, Role::User]

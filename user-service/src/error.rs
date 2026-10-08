@@ -20,6 +20,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("missing or invalid credentials")]
     Unauthorized,
+    #[error("{0}")]
+    Forbidden(&'static str),
     #[error("not found")]
     NotFound,
     #[error("request timed out")]
@@ -37,6 +39,7 @@ impl IntoResponse for AppError {
             Self::Json(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_body"),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Timeout => (StatusCode::SERVICE_UNAVAILABLE, "timeout"),
             Self::Database(_) | Self::Internal(_) => {
