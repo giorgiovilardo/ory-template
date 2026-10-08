@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::extract::{FromRef, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -26,7 +26,7 @@ pub struct ApiState {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/api/users/me", get(get_me).patch(update_me))
+        .route("/api/users/me", get(get_me).put(update_me))
         .with_state(state)
 }
 
@@ -77,20 +77,13 @@ async fn get_me(
     Ok(Json(found.into()))
 }
 
-/// PATCH semantics: a missing field is left alone, `null` clears it.
+/// PUT semantics: the body is the whole editable profile. Every field is required;
+/// `null` clears it.
 #[derive(Debug, Deserialize)]
 struct UpdateMe {
-    #[allow(
-        clippy::option_option,
-        reason = "absent / null / value is the PATCH contract"
-    )]
-    #[serde(default, deserialize_with = "present")]
-    display_name: Option<Option<String>>,
-}
-
-/// Distinguishes "field absent" (`None`, via `default`) from "field is null" (`Some(None)`).
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
-    T::deserialize(d).map(Some)
+    // Overrides serde's "missing `Option` field means `None`", so `{}` is rejected.
+    #[serde(deserialize_with = "Option::deserialize")]
+    display_name: Option<String>,
 }
 
 async fn update_me(
@@ -98,14 +91,9 @@ async fn update_me(
     claims: Claims,
     AppJson(body): AppJson<UpdateMe>,
 ) -> Result<Json<MeResponse>, AppError> {
-    let found = match body.display_name {
-        None => db::find_with_roles(&state.db, claims.sub).await?,
-        Some(raw) => {
-            // Parsed here (not in the struct) so a bad name gets its precise error code.
-            let name = raw.map(DisplayName::try_from).transpose()?;
-            db::set_display_name(&state.db, claims.sub, name.as_ref()).await?
-        }
-    };
+    // Parsed here (not in the struct) so a bad name gets its precise error code.
+    let name = body.display_name.map(DisplayName::try_from).transpose()?;
+    let found = db::set_display_name(&state.db, claims.sub, name.as_ref()).await?;
     Ok(Json(found.ok_or(AppError::NotFound)?.into()))
 }
 
@@ -175,12 +163,12 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn patch_sets_keeps_and_clears_display_name(db: PgPool) {
+    async fn put_sets_and_clears_display_name(db: PgPool) {
         let (_, token) = existing_user(&db).await;
 
         let (status, body) = call(
             &db,
-            Method::PATCH,
+            Method::PUT,
             Some(token.clone()),
             Some(json!({ "display_name": " Ada " })),
         )
@@ -188,15 +176,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["display_name"], "Ada");
 
-        let (_, body) = call(&db, Method::PATCH, Some(token.clone()), Some(json!({}))).await;
-        assert_eq!(
-            body["display_name"], "Ada",
-            "absent field must not change anything"
-        );
-
         let (_, body) = call(
             &db,
-            Method::PATCH,
+            Method::PUT,
             Some(token),
             Some(json!({ "display_name": null })),
         )
@@ -205,11 +187,20 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn patch_rejects_invalid_names_with_precise_code(db: PgPool) {
+    async fn put_requires_every_field(db: PgPool) {
+        let (_, token) = existing_user(&db).await;
+        let (status, body) = call(&db, Method::PUT, Some(token), Some(json!({}))).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "invalid_body");
+    }
+
+    #[sqlx::test]
+    async fn put_rejects_invalid_names_with_precise_code(db: PgPool) {
         let (_, token) = existing_user(&db).await;
         let (status, body) = call(
             &db,
-            Method::PATCH,
+            Method::PUT,
             Some(token),
             Some(json!({ "display_name": "   " })),
         )
@@ -220,11 +211,11 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn patch_rejects_malformed_json_in_app_format(db: PgPool) {
+    async fn put_rejects_malformed_json_in_app_format(db: PgPool) {
         let (_, token) = existing_user(&db).await;
         let (status, body) = call(
             &db,
-            Method::PATCH,
+            Method::PUT,
             Some(token),
             Some(json!({ "display_name": 42 })),
         )

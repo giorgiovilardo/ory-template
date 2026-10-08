@@ -64,6 +64,8 @@ Defined in `oathkeeper/access-rules.yml`, which reloads live without a restart. 
 | `/api/app/**` | browser session **or** `Authorization: Bearer <kratos session token>` | 401 JSON | JWT |
 | `/api/users/**` | same | 401 JSON | user-service gets the JWT |
 
+user-service's own API is `GET /api/users/me` (profile + roles) and `PUT /api/users/me`, which replaces the editable profile: `{"display_name": "Ada"}`, or `null` to clear it. Every field is required.
+
 Rules must not overlap (Oathkeeper rejects a request that matches two), so give each service its own prefix: `/api/<service>/**`.
 
 On every route, Oathkeeper blanks the `ory_kratos_session` cookie before forwarding, so the session credential never reaches your app.

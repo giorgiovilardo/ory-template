@@ -61,7 +61,7 @@
 - id: users-api
   match:
     url: http://localhost:8080/api/users/<**>
-    methods: [GET, PATCH]
+    methods: [GET, PUT]
   upstream:
     url: http://user-service:3000
   authenticators:
