@@ -1,4 +1,5 @@
-//! The command line. Admin subcommands run inside the container:
+//! The command line: `serve`, the one-shot `migrate` and `healthcheck`, and the user-admin
+//! commands (bodies in `admin.rs`). Admin commands run inside the container:
 //! `docker compose exec user-service /user-service grant-role me@x.com admin`.
 //! Granting roles needs no admin API, which avoids the "who grants the first admin" problem.
 
@@ -6,12 +7,11 @@ use std::str::FromStr;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::config::{self, Database, KratosAdmin, PublicAddr, ServeConfig};
 use crate::models::{Email, EmailError, Role};
-use crate::{db, kratos, server};
+use crate::{admin, db, server};
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +37,30 @@ pub enum Command {
         #[command(flatten)]
         public: PublicAddr,
     },
+    /// List every user: Kratos identity, login state, verification, roles.
+    Users {
+        #[command(flatten)]
+        database: Database,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
+    /// Show one user as JSON: the full Kratos identity, active sessions, this service's data.
+    User {
+        email: Email,
+        #[command(flatten)]
+        database: Database,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
+    /// Create a user with a password and an already-verified email (dev seeding).
+    AddUser {
+        email: Email,
+        password: String,
+        #[command(flatten)]
+        database: Database,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
     /// Grant a role to the Kratos identity with this email.
     GrantRole {
         email: Email,
@@ -55,7 +79,39 @@ pub enum Command {
         #[command(flatten)]
         kratos_admin: KratosAdmin,
     },
-    /// Delete this service's data for a user (Kratos deletion is separate).
+    /// Log a user out everywhere: delete all their sessions.
+    RevokeSessions {
+        email: Email,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
+    /// Block a user: their sessions stop working at once and login is refused.
+    Deactivate {
+        email: Email,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
+    /// Unblock a deactivated user (their suspended sessions work again).
+    Activate {
+        email: Email,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
+    /// Print a one-hour account recovery link and code to send to the user.
+    Recover {
+        email: Email,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
+    /// Delete a user for good: the Kratos identity, then this service's data.
+    DeleteUser {
+        email: Email,
+        #[command(flatten)]
+        database: Database,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
+    /// Delete only this service's data for a user (e.g. left over after a failed `delete-user`).
     ForgetUser {
         /// An email (looked up in Kratos) or a Kratos identity id.
         target: EmailOrId,
@@ -89,23 +145,59 @@ impl Command {
             Self::Serve(config) => server::serve(config).await,
             Self::Migrate { database } => migrate(&database).await,
             Self::Healthcheck { public } => healthcheck(&public).await,
+            Self::Users {
+                database,
+                kratos_admin,
+            } => admin::users(&database, &kratos_admin).await,
+            Self::User {
+                email,
+                database,
+                kratos_admin,
+            } => admin::user(&email, &database, &kratos_admin).await,
+            Self::AddUser {
+                email,
+                password,
+                database,
+                kratos_admin,
+            } => admin::add_user(&email, &password, &database, &kratos_admin).await,
             Self::GrantRole {
                 email,
                 role,
                 database,
                 kratos_admin,
-            } => grant_role(&email, role, &database, &kratos_admin).await,
+            } => admin::grant_role(&email, role, &database, &kratos_admin).await,
             Self::RevokeRole {
                 email,
                 role,
                 database,
                 kratos_admin,
-            } => revoke_role(&email, role, &database, &kratos_admin).await,
+            } => admin::revoke_role(&email, role, &database, &kratos_admin).await,
+            Self::RevokeSessions {
+                email,
+                kratos_admin,
+            } => admin::revoke_sessions(&email, &kratos_admin).await,
+            Self::Deactivate {
+                email,
+                kratos_admin,
+            } => admin::deactivate(&email, &kratos_admin).await,
+            Self::Activate {
+                email,
+                kratos_admin,
+            } => admin::activate(&email, &kratos_admin).await,
+            Self::Recover {
+                email,
+                kratos_admin,
+            } => admin::recover(&email, &kratos_admin).await,
+            Self::DeleteUser {
+                email,
+                database,
+                kratos_admin,
+            } => admin::delete_user(&email, &database, &kratos_admin).await,
             Self::ForgetUser {
                 target,
                 database,
                 kratos_admin,
-            } => forget_user(&target, &database, &kratos_admin).await,
+            } => admin::forget_user(&target, &database, &kratos_admin).await,
         }
     }
 }
@@ -119,93 +211,6 @@ async fn migrate(database: &Database) -> anyhow::Result<()> {
     migrator.run(&db).await.context("running migrations")?;
     let latest = migrator.iter().map(|m| m.version).max().unwrap_or(0);
     println!("migrations up to date (latest version: {latest})");
-    Ok(())
-}
-
-/// Finds the Kratos identity that logs in with this email. Kratos is the only
-/// reliable email -> id mapping: our `users.email` is a copy that is neither unique
-/// nor current (it's refreshed only when the user makes a request), so matching on
-/// it can pick another account or miss the right one.
-async fn identity_for(
-    email: &Email,
-    kratos_admin: &KratosAdmin,
-) -> anyhow::Result<kratos::KratosIdentity> {
-    kratos::find_identity_by_email(&config::http_client()?, &kratos_admin.url, email)
-        .await
-        .context("looking up the user in Kratos")?
-        .with_context(|| format!("no Kratos identity with email {email}"))
-}
-
-async fn grant_role(
-    email: &Email,
-    role: Role,
-    database: &Database,
-    kratos_admin: &KratosAdmin,
-) -> anyhow::Result<()> {
-    let identity = identity_for(email, kratos_admin).await?;
-    let db = db::connect(database).await?;
-    // Creates the row for users who registered but never made a request through
-    // Oathkeeper, and refreshes a stale email copy.
-    let id = identity.id;
-    db::sync_identity(&db, &identity).await?;
-    if db::grant_role(&db, id, role).await? {
-        println!("{email} ({id}): granted {role}");
-    } else {
-        println!("{email} ({id}): already has {role}");
-    }
-    print_roles(&db, id).await
-}
-
-async fn revoke_role(
-    email: &Email,
-    role: Role,
-    database: &Database,
-    kratos_admin: &KratosAdmin,
-) -> anyhow::Result<()> {
-    let id = identity_for(email, kratos_admin).await?.id;
-    let db = db::connect(database).await?;
-    if db::find_by_id(&db, id).await?.is_none() {
-        bail!("{email} ({id}) has no user-service data, so no roles");
-    }
-    if db::revoke_role(&db, id, role).await? {
-        println!("{email} ({id}): revoked {role}");
-    } else {
-        println!("{email} ({id}): did not have {role}");
-    }
-    print_roles(&db, id).await
-}
-
-async fn print_roles(db: &PgPool, id: Uuid) -> anyhow::Result<()> {
-    let roles = db::roles_of(db, id).await?;
-    let names: Vec<&str> = roles.iter().map(|role| role.as_str()).collect();
-    println!(
-        "roles now: [{}] (in the JWT from the next request on)",
-        names.join(", ")
-    );
-    Ok(())
-}
-
-/// Deletes this service's data for a user. Kratos deletion is separate (`just delete-user`
-/// does both, Kratos first). An email is looked up in Kratos, so it fails if the identity
-/// is already gone; an id works for data left behind after that.
-async fn forget_user(
-    target: &EmailOrId,
-    database: &Database,
-    kratos_admin: &KratosAdmin,
-) -> anyhow::Result<()> {
-    let (label, id) = match target {
-        EmailOrId::Id(id) => (id.to_string(), *id),
-        EmailOrId::Email(email) => {
-            let id = identity_for(email, kratos_admin).await?.id;
-            (format!("{email} ({id})"), id)
-        }
-    };
-    let db = db::connect(database).await?;
-    if db::delete_user(&db, id).await? {
-        println!("{label}: user-service data deleted");
-    } else {
-        println!("{label}: no user-service data (never logged in through Oathkeeper)");
-    }
     Ok(())
 }
 
@@ -262,6 +267,27 @@ mod tests {
         };
         assert!(args("nope", "admin").is_err());
         assert!(args("a@b.c", "superuser").is_err());
+    }
+
+    #[test]
+    fn kratos_only_commands_need_no_database() {
+        for command in ["revoke-sessions", "deactivate", "activate", "recover"] {
+            let cli = Cli::try_parse_from(["user-service", command, "Ada@Example.com"]);
+            assert!(cli.is_ok(), "{command}");
+        }
+        let cli = Cli::try_parse_from([
+            "user-service",
+            "add-user",
+            "ada@example.com",
+            "S3cret pass!",
+            "--database-url",
+            "x",
+        ])
+        .unwrap();
+        let Command::AddUser { password, .. } = cli.command else {
+            panic!("expected add-user");
+        };
+        assert_eq!(password, "S3cret pass!");
     }
 
     #[test]

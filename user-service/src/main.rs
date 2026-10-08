@@ -1,3 +1,4 @@
+mod admin;
 mod api;
 mod auth;
 mod cli;

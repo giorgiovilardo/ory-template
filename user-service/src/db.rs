@@ -132,6 +132,17 @@ pub async fn roles_of(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<Role>> {
     .await
 }
 
+/// Every user's roles, for listings. Users with no row yet (never made a request) are absent.
+pub async fn all_roles(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Vec<Role>)>> {
+    let rows = sqlx::query!(
+        r#"select id, array(select role from user_roles where user_id = users.id order by role) as "roles!: Vec<Role>"
+           from users"#
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.id, row.roles)).collect())
+}
+
 /// `None` clears the display name. Returns `None` if the user doesn't exist.
 /// The roles come from the same statement as the update.
 pub async fn set_display_name(
@@ -305,6 +316,26 @@ mod tests {
         assert!(revoke_role(&db, id, Role::Admin).await.unwrap());
         assert!(!revoke_role(&db, id, Role::Admin).await.unwrap());
         assert_eq!(roles_of(&db, id).await.unwrap(), vec![Role::User]);
+    }
+
+    #[sqlx::test]
+    async fn lists_everyones_roles(db: PgPool) {
+        let (ada, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        sync_identity(&db, &identity(ada, "ada@example.com"))
+            .await
+            .unwrap();
+        sync_identity(&db, &identity(bob, "bob@example.com"))
+            .await
+            .unwrap();
+        grant_role(&db, ada, Role::Admin).await.unwrap();
+        revoke_role(&db, bob, Role::User).await.unwrap();
+
+        let mut all = all_roles(&db).await.unwrap();
+        all.sort_by_key(|(id, _)| *id != ada);
+        assert_eq!(
+            all,
+            vec![(ada, vec![Role::Admin, Role::User]), (bob, vec![])]
+        );
     }
 
     #[sqlx::test]
