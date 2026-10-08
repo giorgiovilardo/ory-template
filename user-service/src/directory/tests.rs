@@ -505,3 +505,53 @@ async fn two_admins_cant_remove_each_other_at_once(db: PgPool) {
         }
     }
 }
+
+#[sqlx::test]
+async fn reconciles_rows_with_kratos(db: PgPool) {
+    let (directory, kratos) = directory(&db);
+    let in_sync = existing_user(&db, &kratos, "ada@example.com").await;
+    let missing = kratos.add(FakeIdentity::new("bob@example.com"));
+    let stale = existing_user(&db, &kratos, "carol@example.com").await;
+    db::grant_role(&db, stale, Role::Admin).await.unwrap();
+    kratos.set_email(stale, "carol@new.example.com");
+    let odd = kratos.add(FakeIdentity::new("not an email"));
+    let orphan = Uuid::new_v4();
+    db::sync_identity(&db, &crate::testing::identity(orphan, "gone@example.com"))
+        .await
+        .unwrap();
+
+    let done = directory.reconcile().await.unwrap();
+    assert_eq!(
+        done,
+        Reconciled {
+            created: vec![missing],
+            refreshed: vec![stale],
+            skipped: vec![odd],
+            orphans: vec![orphan],
+        }
+    );
+    assert_eq!(db::roles_of(&db, missing).await.unwrap(), vec![Role::User]);
+    assert_eq!(
+        db::roles_of(&db, stale).await.unwrap(),
+        vec![Role::Admin, Role::User],
+        "kept"
+    );
+    let refreshed = db::find_by_id(&db, stale).await.unwrap().unwrap();
+    assert_eq!(refreshed.email, email("carol@new.example.com"));
+    assert!(
+        db::find_by_id(&db, orphan).await.unwrap().is_some(),
+        "only reported"
+    );
+    assert!(!done.created.contains(&in_sync) && !done.refreshed.contains(&in_sync));
+
+    // Nothing left to do.
+    let again = directory.reconcile().await.unwrap();
+    assert_eq!(
+        again,
+        Reconciled {
+            skipped: vec![odd],
+            orphans: vec![orphan],
+            ..Reconciled::default()
+        }
+    );
+}

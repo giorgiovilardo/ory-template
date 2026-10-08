@@ -98,6 +98,11 @@ recover email:
 delete-user email:
     @{{user_service}} delete-user {{email}}
 
+# Create missing user-service rows and refresh stale emails from Kratos (catches up on missed web hooks)
+[group('users')]
+reconcile:
+    @{{user_service}} reconcile
+
 # Recreate Kratos, Oathkeeper and user-service to pick up config, schema or .env changes
 restart:
     docker compose up -d --build --force-recreate kratos oathkeeper user-service

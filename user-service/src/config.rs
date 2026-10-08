@@ -65,6 +65,9 @@ pub struct ServeConfig {
     /// Basic-auth password Oathkeeper uses for `/internal/hydrate`.
     #[arg(long, env = "HYDRATOR_PASSWORD", hide_env_values = true)]
     pub hydrator_password: String,
+    /// Basic-auth password Kratos' web hook uses for `/internal/kratos/identity`.
+    #[arg(long, env = "KRATOS_WEBHOOK_PASSWORD", hide_env_values = true)]
+    pub kratos_webhook_password: String,
     #[arg(
         long,
         env = "JWKS_URL",
@@ -75,7 +78,7 @@ pub struct ServeConfig {
     pub jwt_issuer: String,
     #[command(flatten)]
     pub public: PublicAddr,
-    /// Never routed through Oathkeeper: `/internal/hydrate`.
+    /// Never routed through Oathkeeper: `/internal/hydrate`, `/internal/kratos/identity`.
     #[arg(long, env = "INTERNAL_ADDR", default_value = "0.0.0.0:3001")]
     pub internal_addr: SocketAddr,
 }

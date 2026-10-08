@@ -1,6 +1,6 @@
 //! `serve`: the long-running process. Two listeners on one database pool: Oathkeeper
-//! routes only to the public one, so the internal endpoint is unreachable from outside
-//! regardless of path rules.
+//! routes only to the public one, so the internal endpoints (the hydrator, Kratos' web
+//! hook) are unreachable from outside regardless of path rules.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +21,7 @@ use crate::directory::Directory;
 use crate::error::AppError;
 use crate::hydrate::{self, HydrateState};
 use crate::kratos::AdminApi;
+use crate::webhook::{self, WebhookState};
 
 /// Under Oathkeeper's hydrator `give_up_after` (2s, oathkeeper.yml), so a stalled database
 /// fails fast and leaves room for its retry. Every query here is a single small statement.
@@ -54,8 +55,12 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         )),
     };
     let hydrate_state = HydrateState {
-        db,
+        db: db.clone(),
         password: config.hydrator_password.into(),
+    };
+    let webhook_state = WebhookState {
+        db,
+        password: config.kratos_webhook_password.into(),
     };
 
     let public_routes = with_timeout(api::router(api_state), REQUEST_TIMEOUT).merge(with_timeout(
@@ -70,7 +75,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let internal = axum::serve(
         TcpListener::bind(config.internal_addr).await?,
         with_tracing(with_timeout(
-            hydrate::router(hydrate_state),
+            hydrate::router(hydrate_state).merge(webhook::router(webhook_state)),
             REQUEST_TIMEOUT,
         )),
     )

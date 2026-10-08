@@ -162,6 +162,13 @@ pub async fn admin_ids(conn: &mut PgConnection) -> sqlx::Result<Vec<Uuid>> {
     .await
 }
 
+/// Every user id with a row (for `reconcile`).
+pub async fn all_user_ids(db: &PgPool) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar!("select id from users")
+        .fetch_all(db)
+        .await
+}
+
 /// The users among `ids` that have a row, with their roles, in one query (for listings).
 /// Ids without a row (no data yet) are simply absent.
 pub async fn find_many_with_roles(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<UserWithRoles>> {

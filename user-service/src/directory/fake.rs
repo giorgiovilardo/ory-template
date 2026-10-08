@@ -75,6 +75,10 @@ impl FakeKratos {
         self.state().identities.get(&id).cloned()
     }
 
+    pub fn set_email(&self, id: Uuid, email: &str) {
+        self.state().identities.get_mut(&id).unwrap().email = email.to_owned();
+    }
+
     pub fn get_by_email(&self, email: &str) -> Option<FakeIdentity> {
         self.state()
             .identities

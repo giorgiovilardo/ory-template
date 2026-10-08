@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::cli::EmailOrId;
 use crate::config::{self, Database, KratosAdmin};
 use crate::db;
-use crate::directory::{Accounts, Actor, Directory, DirectoryError};
+use crate::directory::{Accounts, Actor, Directory, DirectoryError, Reconciled};
 use crate::kratos::{AdminApi, IdentityState};
 use crate::models::{Email, Role, StoredUser};
 
@@ -63,7 +63,7 @@ pub async fn users(database: &Database, kratos_admin: &KratosAdmin) -> anyhow::R
         );
     }
     println!(
-        "\n{} user(s). Roles \"-\": no user-service data yet (created on their first request).",
+        "\n{} user(s). Roles \"-\": no user-service data (`reconcile` creates it).",
         users.len()
     );
     Ok(())
@@ -212,7 +212,36 @@ pub async fn delete_user(
     if deleted.had_data {
         println!("{email} ({id}): user-service data deleted");
     } else {
-        println!("{email} ({id}): no user-service data (never logged in through Oathkeeper)");
+        println!("{email} ({id}): no user-service data");
+    }
+    Ok(())
+}
+
+pub async fn reconcile(database: &Database, kratos_admin: &KratosAdmin) -> anyhow::Result<()> {
+    let done = directory(database, kratos_admin).await?.reconcile().await?;
+    let report = |ids: &[Uuid], what: &str| {
+        if !ids.is_empty() {
+            println!("{} {what}:", ids.len());
+            for id in ids {
+                println!("  {id}");
+            }
+        }
+    };
+    report(
+        &done.created,
+        "user(s) had no user-service data: created, with the `user` role",
+    );
+    report(&done.refreshed, "stale email copy(ies): refreshed");
+    report(
+        &done.skipped,
+        "Kratos identity(ies) without a valid email: skipped",
+    );
+    report(
+        &done.orphans,
+        "row(s) without a Kratos identity: left alone, remove with `forget-user <id>`",
+    );
+    if done == Reconciled::default() {
+        println!("in sync: every Kratos identity has its user-service data");
     }
     Ok(())
 }
@@ -235,7 +264,7 @@ pub async fn forget_user(
     if directory.forget(id).await? {
         println!("{label}: user-service data deleted");
     } else {
-        println!("{label}: no user-service data (never logged in through Oathkeeper)");
+        println!("{label}: no user-service data");
     }
     Ok(())
 }

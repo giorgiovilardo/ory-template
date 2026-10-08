@@ -56,6 +56,12 @@ services:
       - "127.0.0.1:4434:4434" # admin API (never expose this publicly)
     environment:
       <<: *kratos-env
+      # The user-service web hook's password, wherever kratos.yml uses the hook.
+      SELFSERVICE_FLOWS_REGISTRATION_AFTER_PASSWORD_HOOKS_0_CONFIG_AUTH_CONFIG_PASSWORD: &webhook-password ${KRATOS_WEBHOOK_PASSWORD:?run `just init` first}
+      SELFSERVICE_FLOWS_REGISTRATION_AFTER_CODE_HOOKS_0_CONFIG_AUTH_CONFIG_PASSWORD: *webhook-password
+      SELFSERVICE_FLOWS_REGISTRATION_AFTER_PASSKEY_HOOKS_0_CONFIG_AUTH_CONFIG_PASSWORD: *webhook-password
+      SELFSERVICE_FLOWS_REGISTRATION_AFTER_OIDC_HOOKS_0_CONFIG_AUTH_CONFIG_PASSWORD: *webhook-password
+      SELFSERVICE_FLOWS_SETTINGS_AFTER_PROFILE_HOOKS_0_CONFIG_AUTH_CONFIG_PASSWORD: *webhook-password
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
@@ -151,6 +157,7 @@ services:
     environment:
       DATABASE_URL: postgres://users:${USERS_DB_PASSWORD}@postgres:5432/users
       HYDRATOR_PASSWORD: ${HYDRATOR_PASSWORD}
+      KRATOS_WEBHOOK_PASSWORD: ${KRATOS_WEBHOOK_PASSWORD}
       JWKS_URL: http://oathkeeper:4456/.well-known/jwks.json
       JWT_ISSUER: http://localhost:8080/
       # The admin API and CLI act on identities through it. Compose network only: the

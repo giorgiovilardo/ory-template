@@ -8,12 +8,13 @@ use std::time::Duration;
 use axum::extract::{FromRef, FromRequestParts};
 use axum::http::request::Parts;
 use axum_extra::TypedHeader;
-use axum_extra::headers::Authorization;
-use axum_extra::headers::authorization::Bearer;
+use axum_extra::headers::authorization::{Basic, Bearer};
+use axum_extra::headers::{Authorization, HeaderMapExt};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -194,6 +195,18 @@ where
             AppError::Unauthorized
         })
     }
+}
+
+/// Whether the request carries exactly these Basic credentials. For the internal
+/// listener's callers (Oathkeeper's hydrator, Kratos' web hook), each with its own
+/// password. Constant-time comparison: don't leak how much of the password matched.
+pub fn has_basic_credentials(parts: &Parts, username: &str, password: &str) -> bool {
+    let Some(Authorization(basic)) = parts.headers.typed_get::<Authorization<Basic>>() else {
+        return false;
+    };
+    let user_ok = basic.username().as_bytes().ct_eq(username.as_bytes());
+    let password_ok = basic.password().as_bytes().ct_eq(password.as_bytes());
+    (user_ok & password_ok).into()
 }
 
 /// Extractor: a valid JWT whose subject has the `admin` role. The role is read from the

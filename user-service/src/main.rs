@@ -13,6 +13,7 @@ mod models;
 mod server;
 #[cfg(test)]
 mod testing;
+mod webhook;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;

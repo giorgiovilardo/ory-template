@@ -10,7 +10,7 @@
 //! Kratos sits behind the `IdentityAdmin` port, implemented by `kratos::AdminApi`, so the
 //! logic here is tested against an in-memory fake (`directory/fake.rs`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use reqwest::StatusCode;
@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::kratos::{
-    Identity, IdentityPage, IdentityState, KratosError, KratosIdentity, RecoveryCode,
+    Identity, IdentityPage, IdentityState, KratosError, KratosIdentity, RecoveryCode, Traits,
 };
 use crate::models::{Email, Role, UserWithRoles};
 
@@ -203,6 +203,19 @@ pub struct RoleChange {
     /// False if the user already had (or already lacked) the role.
     pub changed: bool,
     pub roles: Vec<Role>,
+}
+
+/// What `reconcile` did, by identity id.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Identities without a row: created, with the `user` role.
+    pub created: Vec<Uuid>,
+    /// Rows whose email copy was stale: refreshed.
+    pub refreshed: Vec<Uuid>,
+    /// Identities without a valid email, left alone.
+    pub skipped: Vec<Uuid>,
+    /// Rows with no Kratos identity (e.g. after a failed delete): reported, not deleted.
+    pub orphans: Vec<Uuid>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -448,6 +461,44 @@ impl<K: IdentityAdmin> Directory<K> {
             return Err(DirectoryError::NoSuchUser(id));
         }
         Ok(Deleted { had_data })
+    }
+
+    /// Brings this service's rows in line with Kratos: creates the missing ones and
+    /// refreshes stale email copies. Kratos' web hook normally does both, so this is for
+    /// whatever it missed: a failed hook, identities made through Kratos' admin API, users
+    /// from before the hook existed. Idempotent. Orphan rows are only reported: deleting
+    /// data is `forget`'s job, on purpose.
+    pub async fn reconcile(&self) -> Result<Reconciled> {
+        // Rows first: one created after this by a new registration can't be mistaken
+        // for an orphan, since its identity will be in the listing below.
+        let rows = db::all_user_ids(&self.db).await?;
+        let users = self.all_users().await?;
+        let known: HashSet<Uuid> = users.iter().map(|user| user.identity.id).collect();
+
+        let mut done = Reconciled::default();
+        for ListedUser { identity, stored } in users {
+            let id = identity.id;
+            let Some(email) = identity
+                .traits
+                .email
+                .and_then(|email| email.parse::<Email>().ok())
+            else {
+                done.skipped.push(id);
+                continue;
+            };
+            match stored {
+                None => done.created.push(id),
+                Some(stored) if stored.user.email != email => done.refreshed.push(id),
+                Some(_) => continue,
+            }
+            let identity = KratosIdentity {
+                id,
+                traits: Traits { email },
+            };
+            db::sync_identity(&self.db, &identity).await?;
+        }
+        done.orphans = rows.into_iter().filter(|id| !known.contains(id)).collect();
+        Ok(done)
     }
 
     /// Deletes only this service's data. Returns false if there was none.
