@@ -39,28 +39,28 @@ up: init
     @echo "  Kratos API    http://localhost:4433 (public)  http://localhost:4434 (admin)"
     @echo "  JWKS          http://localhost:4456/.well-known/jwks.json"
 
-admin := "python3 scripts/admin.py"
-
 # Log in as an existing user and print the JWT your app would receive
 jwt email password:
-    @{{admin}} jwt {{email}} {{quote(password)}}
+    @python3 scripts/jwt.py {{email}} {{quote(password)}}
 
-# List all users
+# User admin is user-service's CLI, run inside its container (it reaches the Kratos
+# admin API and its own database there). `-T`: no TTY, so output pipes cleanly.
+user_service := "docker compose exec -T user-service /user-service"
+
+# List all users: Kratos state, verification, roles
 [group('users')]
 users:
-    @{{admin}} users
+    @{{user_service}} users
 
-# Show one user: traits, metadata, verified addresses, active sessions
+# Show one user: Kratos identity, active sessions, user-service data (JSON)
 [group('users')]
 user email:
-    @{{admin}} user {{email}}
+    @{{user_service}} user {{email}}
 
 # Create a verified user, e.g. `just add-user me@x.com 'S3cret-pass!'`
 [group('users')]
 add-user email password:
-    @{{admin}} add-user {{email}} {{quote(password)}}
-
-user_service := "docker compose exec -T user-service /user-service"
+    @{{user_service}} add-user {{email}} {{quote(password)}}
 
 # Give a user a role (admin, user), e.g. `just grant-role me@x.com admin`
 [group('users')]
@@ -75,37 +75,28 @@ revoke-role email role:
 # Log a user out everywhere
 [group('users')]
 revoke email:
-    @{{admin}} revoke {{email}}
+    @{{user_service}} revoke-sessions {{email}}
 
 # Block a user: their sessions stop working immediately and login is refused
 [group('users')]
 deactivate email:
-    @{{admin}} deactivate {{email}}
+    @{{user_service}} deactivate {{email}}
 
 # Unblock a deactivated user
 [group('users')]
 activate email:
-    @{{admin}} activate {{email}}
+    @{{user_service}} activate {{email}}
 
 # Generate a one-hour account recovery link + code for a user
 [group('users')]
 recover email:
-    @{{admin}} recover {{email}}
+    @{{user_service}} recover {{email}}
 
 # Permanently delete a user (the Kratos identity first, then user-service data)
 [group('users')]
 [confirm("Permanently delete this user? (y/N)")]
 delete-user email:
-    #!/usr/bin/env sh
-    set -eu
-    # Kratos first: once the identity is gone, no request can reach user-service for this
-    # user, so nothing can re-create the row we're about to delete. (The other way round, a
-    # request in between would leave an orphan.) The id is read up front because the email
-    # can't be looked up afterwards. If the second step fails, rerun it by id:
-    # `docker compose exec user-service /user-service forget-user <id>`.
-    id=$({{admin}} id {{email}})
-    {{admin}} delete-user {{email}}
-    {{user_service}} forget-user "$id"
+    @{{user_service}} delete-user {{email}}
 
 # Recreate Kratos, Oathkeeper and user-service to pick up config, schema or .env changes
 restart:

@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, array(select role from user_roles where user_id = users.id order by role) as \"roles!: Vec<Role>\"\n           from users",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "roles!: Vec<Role>",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "5063160500f20fde0a3cd32056a67193eb5421d9893e3d9cb1265f78fd680b70"
+}
