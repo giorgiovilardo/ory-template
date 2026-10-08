@@ -111,6 +111,14 @@ pub enum Command {
         #[command(flatten)]
         kratos_admin: KratosAdmin,
     },
+    /// Create the missing user rows and refresh stale emails from Kratos (catches up on
+    /// whatever the registration web hook missed). Idempotent.
+    Reconcile {
+        #[command(flatten)]
+        database: Database,
+        #[command(flatten)]
+        kratos_admin: KratosAdmin,
+    },
     /// Delete only this service's data for a user (e.g. left over after a failed `delete-user`).
     ForgetUser {
         /// An email (looked up in Kratos) or a Kratos identity id.
@@ -193,6 +201,10 @@ impl Command {
                 database,
                 kratos_admin,
             } => admin::delete_user(&email, &database, &kratos_admin).await,
+            Self::Reconcile {
+                database,
+                kratos_admin,
+            } => admin::reconcile(&database, &kratos_admin).await,
             Self::ForgetUser {
                 target,
                 database,

@@ -1,54 +1,83 @@
 //! `serve`: the long-running process. Two listeners on one database pool: Oathkeeper
-//! routes only to the public one, so the internal endpoint is unreachable from outside
-//! regardless of path rules.
+//! routes only to the public one, so the internal endpoints (the hydrator, Kratos' web
+//! hook) are unreachable from outside regardless of path rules.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
+use crate::admin_api::{self, AdminState};
 use crate::api::{self, ApiState};
 use crate::auth::JwtVerifier;
 use crate::config::{self, ServeConfig};
 use crate::db;
+use crate::directory::Directory;
 use crate::error::AppError;
 use crate::hydrate::{self, HydrateState};
+use crate::kratos::AdminApi;
+use crate::webhook::{self, WebhookState};
 
 /// Under Oathkeeper's hydrator `give_up_after` (2s, oathkeeper.yml), so a stalled database
 /// fails fast and leaves room for its retry. Every query here is a single small statement.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The admin API calls Kratos, sometimes several times per request (a guarded change
+/// checks which admins are still active). Its own budget, so `/me` and the hydrator
+/// keep theirs.
+const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let db = db::connect(&config.database).await?;
     // No migrations here: the one-shot `user-service migrate` job runs them before
     // this starts (see docker-compose.yml), so serving never needs DDL rights.
 
+    let verifier = Arc::new(JwtVerifier::remote(
+        config.jwks_url,
+        &config.jwt_issuer,
+        config::http_client()?,
+    ));
     let api_state = ApiState {
         db: db.clone(),
-        verifier: Arc::new(JwtVerifier::remote(
-            config.jwks_url,
-            &config.jwt_issuer,
-            config::http_client()?,
+        verifier: verifier.clone(),
+    };
+    let admin_state = AdminState {
+        db: db.clone(),
+        verifier,
+        directory: Arc::new(Directory::new(
+            db.clone(),
+            AdminApi::new(config::http_client()?, &config.kratos_admin.url),
         )),
     };
     let hydrate_state = HydrateState {
-        db,
+        db: db.clone(),
         password: config.hydrator_password.into(),
     };
+    let webhook_state = WebhookState {
+        db,
+        password: config.kratos_webhook_password.into(),
+    };
 
+    let public_routes = with_timeout(api::router(api_state), REQUEST_TIMEOUT).merge(with_timeout(
+        admin_api::router(admin_state),
+        ADMIN_REQUEST_TIMEOUT,
+    ));
     let public = axum::serve(
         TcpListener::bind(config.public.addr).await?,
-        with_middleware(api::router(api_state)),
+        with_tracing(public_routes),
     )
     .with_graceful_shutdown(shutdown_signal());
     let internal = axum::serve(
         TcpListener::bind(config.internal_addr).await?,
-        with_middleware(hydrate::router(hydrate_state)),
+        with_tracing(with_timeout(
+            hydrate::router(hydrate_state).merge(webhook::router(webhook_state)),
+            REQUEST_TIMEOUT,
+        )),
     )
     .with_graceful_shutdown(shutdown_signal());
 
@@ -57,19 +86,22 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What every request goes through, on both listeners. `TraceLayer`'s default spans log
-/// method + path only, never headers (the hydrator receives the raw Kratos session
-/// cookie); it's outermost, so it also records timeouts.
-fn with_middleware(router: Router) -> Router {
-    router
-        .layer(middleware::from_fn(timeout))
-        .layer(TraceLayer::new_for_http())
+/// Outermost on both listeners. `TraceLayer`'s default spans log method + path only,
+/// never headers (the hydrator receives the raw Kratos session cookie); being outermost,
+/// it also records timeouts.
+fn with_tracing(router: Router) -> Router {
+    router.layer(TraceLayer::new_for_http())
 }
 
-/// Bounds every request, pool wait and query included (`acquire_timeout` only covers
-/// the wait). The timeout comes back in the usual error format, via `AppError`.
-async fn timeout(req: Request, next: Next) -> Response {
-    tokio::time::timeout(REQUEST_TIMEOUT, next.run(req))
+/// Bounds every request of `router`'s routes, pool wait and query included
+/// (`acquire_timeout` only covers the wait). Layered per router before merging, so each
+/// keeps its own budget. The timeout comes back in the usual error format, via `AppError`.
+fn with_timeout(router: Router, budget: Duration) -> Router {
+    router.layer(middleware::from_fn_with_state(budget, timeout))
+}
+
+async fn timeout(State(budget): State<Duration>, req: Request, next: Next) -> Response {
+    tokio::time::timeout(budget, next.run(req))
         .await
         .unwrap_or_else(|_| AppError::Timeout.into_response())
 }
@@ -99,16 +131,38 @@ mod tests {
     use super::*;
     use crate::testing;
 
+    fn sleeping(path: &str, duration: Duration) -> Router {
+        Router::new().route(
+            path,
+            get(move || async move { tokio::time::sleep(duration).await }),
+        )
+    }
+
+    async fn status_of(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
+        testing::send(app, Request::get(path).body(Body::empty()).unwrap()).await
+    }
+
     #[tokio::test(start_paused = true)]
     async fn slow_requests_time_out_in_the_error_format() {
-        let app = with_middleware(Router::new().route(
-            "/",
-            get(|| async { tokio::time::sleep(REQUEST_TIMEOUT * 2).await }),
-        ));
-        let req = Request::get("/").body(Body::empty()).unwrap();
-        let (status, body) = testing::send(app, req).await;
+        let app = with_timeout(sleeping("/", REQUEST_TIMEOUT * 2), REQUEST_TIMEOUT);
+        let (status, body) = status_of(app, "/").await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_router_keeps_its_own_budget() {
+        let slow = REQUEST_TIMEOUT * 2;
+        let app = with_timeout(sleeping("/me", slow), REQUEST_TIMEOUT).merge(with_timeout(
+            sleeping("/admin", slow),
+            ADMIN_REQUEST_TIMEOUT,
+        ));
+
+        assert_eq!(
+            status_of(app.clone(), "/me").await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(status_of(app, "/admin").await.0, StatusCode::OK);
     }
 }

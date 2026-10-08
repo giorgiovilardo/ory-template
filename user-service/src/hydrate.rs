@@ -1,5 +1,7 @@
 //! `POST /internal/hydrate`: called by Oathkeeper's hydrator mutator on every
 //! logged-in request, before it mints the JWT. Adds `extra.profile` to the session.
+//! Read-only: rows are created by Kratos' web hook at registration (`webhook.rs`), so
+//! the hot path never writes.
 //!
 //! Contract (Oathkeeper v26, `pipeline/mutate/mutator_hydrator.go`):
 //! - the body is the full `AuthenticationSession`: `{subject, extra, header, match_context}`;
@@ -14,18 +16,15 @@ use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::routing::post;
 use axum::{Json, Router};
-use axum_extra::TypedHeader;
-use axum_extra::headers::Authorization;
-use axum_extra::headers::authorization::Basic;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
-use subtle::ConstantTimeEq;
 
+use crate::auth::has_basic_credentials;
 use crate::db;
 use crate::error::{AppError, AppJson};
 use crate::kratos::KratosSession;
-use crate::models::{Profile, UserWithRoles};
+use crate::models::Profile;
 
 pub const HYDRATOR_USERNAME: &str = "oathkeeper";
 
@@ -68,10 +67,21 @@ async fn hydrate(
         ));
     }
 
-    let UserWithRoles { user, roles } = db::sync_identity(&state.db, &identity).await?;
-    let profile = Profile {
-        display_name: user.display_name.as_ref(),
-        roles: &roles,
+    let found = db::find_with_roles(&state.db, identity.id).await?;
+    let profile = if let Some(found) = &found {
+        Profile {
+            display_name: found.user.display_name.as_ref(),
+            roles: &found.roles,
+        }
+    } else {
+        // The registration web hook failed, or the identity was made some other way
+        // (Kratos' admin API, before the hook existed). Fail closed on roles, but
+        // don't lock the user out: `reconcile` creates the row.
+        tracing::warn!(id = %identity.id, "no user-service data, empty profile; run `user-service reconcile`");
+        Profile {
+            display_name: None,
+            roles: &[],
+        }
     };
 
     // `json!` unwraps internally: serializing `Profile` (strings and enums) can't fail.
@@ -88,25 +98,16 @@ struct FromOathkeeper;
 impl FromRequestParts<HydrateState> for FromOathkeeper {
     type Rejection = AppError;
 
-    async fn from_request_parts(
+    fn from_request_parts(
         parts: &mut Parts,
         state: &HydrateState,
-    ) -> Result<Self, Self::Rejection> {
-        let TypedHeader(Authorization(basic)) =
-            TypedHeader::<Authorization<Basic>>::from_request_parts(parts, state)
-                .await
-                .map_err(|_| AppError::Unauthorized)?;
-        // Constant-time comparison: don't leak how much of the password matched.
-        let user_ok = basic
-            .username()
-            .as_bytes()
-            .ct_eq(HYDRATOR_USERNAME.as_bytes());
-        let password_ok = basic.password().as_bytes().ct_eq(state.password.as_bytes());
-        if (user_ok & password_ok).into() {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let ok = has_basic_credentials(parts, HYDRATOR_USERNAME, &state.password);
+        std::future::ready(if ok {
             Ok(Self)
         } else {
             Err(AppError::Unauthorized)
-        }
+        })
     }
 }
 
@@ -167,9 +168,18 @@ mod tests {
         crate::testing::send(app(db.clone()), request(body.to_string(), password)).await
     }
 
+    /// A user as the registration web hook leaves them.
+    async fn registered(db: &PgPool, email: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        db::sync_identity(db, &crate::testing::identity(id, email))
+            .await
+            .unwrap();
+        id
+    }
+
     #[sqlx::test]
     async fn adds_profile_and_preserves_everything_else(db: PgPool) {
-        let id = Uuid::new_v4();
+        let id = registered(&db, "ada@example.com").await;
         let input = session(id, "Ada@Example.com");
         let (status, output) = call(&db, &input, Some(PASSWORD)).await;
 
@@ -186,15 +196,33 @@ mod tests {
             .unwrap()
             .remove("profile");
         assert_eq!(without_profile, input);
+    }
 
+    #[sqlx::test]
+    async fn without_data_the_profile_is_empty_and_nothing_is_written(db: PgPool) {
+        let id = Uuid::new_v4();
+        let (status, output) = call(&db, &session(id, "ada@example.com"), Some(PASSWORD)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            output["extra"]["profile"],
+            json!({ "display_name": null, "roles": [] })
+        );
+        assert_eq!(db::find_by_id(&db, id).await.unwrap(), None);
+    }
+
+    #[sqlx::test]
+    async fn never_touches_the_email_copy(db: PgPool) {
+        // Email changes arrive through the settings web hook.
+        let id = registered(&db, "old@example.com").await;
+        call(&db, &session(id, "new@example.com"), Some(PASSWORD)).await;
         let user = db::find_by_id(&db, id).await.unwrap().unwrap();
-        assert_eq!(user.email.as_ref(), "ada@example.com");
+        assert_eq!(user.email.as_ref(), "old@example.com");
     }
 
     #[sqlx::test]
     async fn reflects_current_roles(db: PgPool) {
-        let id = Uuid::new_v4();
-        call(&db, &session(id, "ada@example.com"), Some(PASSWORD)).await;
+        let id = registered(&db, "ada@example.com").await;
         db::grant_role(&db, id, Role::Admin).await.unwrap();
 
         let (_, output) = call(&db, &session(id, "ada@example.com"), Some(PASSWORD)).await;

@@ -1,52 +1,53 @@
-//! The user-admin subcommands. A user is a Kratos identity (login, sessions, whether
-//! they may log in) plus this service's row (profile, roles); these commands act on
-//! both, so there is one place to manage "a user".
-//!
-//! Users are named by email and resolved through Kratos to an identity id. Kratos is
-//! the only reliable email -> id mapping: our `users.email` is a copy that is neither
-//! unique nor current (it's refreshed only when the user makes a request), so matching
-//! on it can pick another account or miss the right one.
+//! The user-admin subcommands: a thin adapter over `directory`. Each one builds what it
+//! needs from config, resolves the email to a Kratos identity id, calls the directory,
+//! and prints the result. The logic (and what "a user" is) lives in `directory.rs`.
 
-use std::collections::HashMap;
-
-use anyhow::{Context, bail};
-use serde::Serialize;
 use serde_json::json;
-use sqlx::PgPool;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::cli::EmailOrId;
 use crate::config::{self, Database, KratosAdmin};
 use crate::db;
-use crate::kratos::{AdminApi, IdentityState, KratosIdentity};
-use crate::models::{DisplayName, Email, Role, User, UserWithRoles};
+use crate::directory::{Accounts, Actor, Directory, DirectoryError, Reconciled};
+use crate::kratos::{AdminApi, IdentityState};
+use crate::models::{Email, Role, StoredUser};
 
 fn kratos(kratos_admin: &KratosAdmin) -> anyhow::Result<AdminApi> {
     Ok(AdminApi::new(config::http_client()?, &kratos_admin.url))
 }
 
-async fn identity_for(api: &AdminApi, email: &Email) -> anyhow::Result<KratosIdentity> {
-    api.find_by_email(email)
-        .await
-        .context("looking up the user in Kratos")?
-        .with_context(|| format!("no Kratos identity with email {email}"))
+fn accounts(kratos_admin: &KratosAdmin) -> anyhow::Result<Accounts<AdminApi>> {
+    Ok(Accounts::new(kratos(kratos_admin)?))
+}
+
+/// Connects first, so a bad database setting fails before anything happens in Kratos.
+async fn directory(
+    database: &Database,
+    kratos_admin: &KratosAdmin,
+) -> anyhow::Result<Directory<AdminApi>> {
+    Ok(Directory::new(
+        db::connect(database).await?,
+        kratos(kratos_admin)?,
+    ))
+}
+
+async fn id_for(accounts: &Accounts<AdminApi>, email: &Email) -> anyhow::Result<Uuid> {
+    Ok(accounts.resolve(email).await?.id)
 }
 
 pub async fn users(database: &Database, kratos_admin: &KratosAdmin) -> anyhow::Result<()> {
-    let identities = kratos(kratos_admin)?.list().await?;
-    let db = db::connect(database).await?;
-    let roles: HashMap<Uuid, Vec<Role>> = db::all_roles(&db).await?.into_iter().collect();
+    let users = directory(database, kratos_admin).await?.all_users().await?;
 
     println!(
         "{:36}  {:32}  {:8}  {:8}  {:10}  CREATED",
         "ID", "EMAIL", "STATE", "VERIFIED", "ROLES"
     );
-    for identity in &identities {
-        let roles = roles.get(&identity.id).map_or("-".to_owned(), |roles| {
-            let names: Vec<&str> = roles.iter().map(|role| role.as_str()).collect();
-            names.join(",")
-        });
+    for user in &users {
+        let identity = &user.identity;
+        let roles = user
+            .stored
+            .as_ref()
+            .map_or("-".to_owned(), |stored| role_names(&stored.roles).join(","));
         let created = identity
             .created_at
             .get(..19)
@@ -62,41 +63,10 @@ pub async fn users(database: &Database, kratos_admin: &KratosAdmin) -> anyhow::R
         );
     }
     println!(
-        "\n{} user(s). Roles \"-\": no user-service data yet (created on their first request).",
-        identities.len()
+        "\n{} user(s). Roles \"-\": no user-service data (`reconcile` creates it).",
+        users.len()
     );
     Ok(())
-}
-
-/// What `user` shows of this service's row; the id and email are already in the
-/// Kratos identity. Fields are listed (exhaustive destructuring below), so a new column
-/// shows up here only by decision, as in `MeResponse`.
-#[derive(Serialize)]
-struct StoredUser {
-    display_name: Option<DisplayName>,
-    roles: Vec<Role>,
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    updated_at: OffsetDateTime,
-}
-
-impl From<UserWithRoles> for StoredUser {
-    fn from(UserWithRoles { user, roles }: UserWithRoles) -> Self {
-        let User {
-            id: _,
-            email: _,
-            display_name,
-            created_at,
-            updated_at,
-        } = user;
-        Self {
-            display_name,
-            roles,
-            created_at,
-            updated_at,
-        }
-    }
 }
 
 pub async fn user(
@@ -104,17 +74,14 @@ pub async fn user(
     database: &Database,
     kratos_admin: &KratosAdmin,
 ) -> anyhow::Result<()> {
-    let api = kratos(kratos_admin)?;
-    let id = identity_for(&api, email).await?.id;
-    let identity = api.identity(id).await?;
-    let active_sessions = api.active_sessions(id).await?;
-    let db = db::connect(database).await?;
-    let stored = db::find_with_roles(&db, id).await?.map(StoredUser::from);
+    let directory = directory(database, kratos_admin).await?;
+    let id = id_for(directory.accounts(), email).await?;
+    let details = directory.details(id).await?;
 
     let shown = json!({
-        "identity": identity,
-        "active_sessions": active_sessions,
-        "user_service": stored,
+        "identity": details.raw_identity,
+        "active_sessions": details.active_sessions,
+        "user_service": details.user.stored.map(StoredUser::from),
     });
     println!("{}", serde_json::to_string_pretty(&shown)?);
     Ok(())
@@ -126,20 +93,13 @@ pub async fn add_user(
     database: &Database,
     kratos_admin: &KratosAdmin,
 ) -> anyhow::Result<()> {
-    // Connect first, so a bad database setting fails before Kratos has the identity.
-    let db = db::connect(database).await?;
-    let identity = kratos(kratos_admin)?
-        .create_identity(email, password)
+    let added = directory(database, kratos_admin)
+        .await?
+        .add_user(email, password)
         .await?;
-    let id = identity.id;
-    println!("{email} ({id}): created, email verified");
-    // The hydrator would create the row on their first request anyway; doing it now
-    // lets `users` show their roles straight away.
-    db::sync_identity(&db, &identity).await.context(
-        "creating the user-service data (the Kratos identity exists; \
-         the data is created on the user's first request)",
-    )?;
-    print_roles(&db, id).await
+    println!("{email} ({}): created, email verified", added.user.id);
+    print_roles(&added.roles);
+    Ok(())
 }
 
 pub async fn grant_role(
@@ -148,18 +108,16 @@ pub async fn grant_role(
     database: &Database,
     kratos_admin: &KratosAdmin,
 ) -> anyhow::Result<()> {
-    let identity = identity_for(&kratos(kratos_admin)?, email).await?;
-    let db = db::connect(database).await?;
-    // Creates the row for users who registered but never made a request through
-    // Oathkeeper, and refreshes a stale email copy.
-    let id = identity.id;
-    db::sync_identity(&db, &identity).await?;
-    if db::grant_role(&db, id, role).await? {
+    let directory = directory(database, kratos_admin).await?;
+    let id = id_for(directory.accounts(), email).await?;
+    let change = directory.grant_role(id, role).await?;
+    if change.changed {
         println!("{email} ({id}): granted {role}");
     } else {
         println!("{email} ({id}): already has {role}");
     }
-    print_roles(&db, id).await
+    print_roles(&change.roles);
+    Ok(())
 }
 
 pub async fn revoke_role(
@@ -168,41 +126,41 @@ pub async fn revoke_role(
     database: &Database,
     kratos_admin: &KratosAdmin,
 ) -> anyhow::Result<()> {
-    let id = identity_for(&kratos(kratos_admin)?, email).await?.id;
-    let db = db::connect(database).await?;
-    if db::find_by_id(&db, id).await?.is_none() {
-        bail!("{email} ({id}) has no user-service data, so no roles");
-    }
-    if db::revoke_role(&db, id, role).await? {
+    let directory = directory(database, kratos_admin).await?;
+    let id = id_for(directory.accounts(), email).await?;
+    let change = directory.revoke_role(Actor::Operator, id, role).await?;
+    if change.changed {
         println!("{email} ({id}): revoked {role}");
     } else {
         println!("{email} ({id}): did not have {role}");
     }
-    print_roles(&db, id).await
-}
-
-async fn print_roles(db: &PgPool, id: Uuid) -> anyhow::Result<()> {
-    let roles = db::roles_of(db, id).await?;
-    let names: Vec<&str> = roles.iter().map(|role| role.as_str()).collect();
-    println!(
-        "roles now: [{}] (in the JWT from the next request on)",
-        names.join(", ")
-    );
+    print_roles(&change.roles);
     Ok(())
 }
 
+fn role_names(roles: &[Role]) -> Vec<&'static str> {
+    roles.iter().map(|role| role.as_str()).collect()
+}
+
+fn print_roles(roles: &[Role]) {
+    println!(
+        "roles now: [{}] (in the JWT from the next request on)",
+        role_names(roles).join(", ")
+    );
+}
+
 pub async fn revoke_sessions(email: &Email, kratos_admin: &KratosAdmin) -> anyhow::Result<()> {
-    let api = kratos(kratos_admin)?;
-    let id = identity_for(&api, email).await?.id;
-    api.revoke_sessions(id).await?;
+    let accounts = accounts(kratos_admin)?;
+    let id = id_for(&accounts, email).await?;
+    accounts.revoke_sessions(id).await?;
     println!("{email} ({id}): all sessions revoked (logged out everywhere)");
     Ok(())
 }
 
 pub async fn deactivate(email: &Email, kratos_admin: &KratosAdmin) -> anyhow::Result<()> {
-    let api = kratos(kratos_admin)?;
-    let id = identity_for(&api, email).await?.id;
-    api.set_state(id, IdentityState::Inactive).await?;
+    let accounts = accounts(kratos_admin)?;
+    let id = id_for(&accounts, email).await?;
+    accounts.set_state(id, IdentityState::Inactive).await?;
     println!(
         "{email} ({id}): deactivated. Existing sessions stop working immediately and login is refused."
     );
@@ -214,17 +172,17 @@ pub async fn deactivate(email: &Email, kratos_admin: &KratosAdmin) -> anyhow::Re
 }
 
 pub async fn activate(email: &Email, kratos_admin: &KratosAdmin) -> anyhow::Result<()> {
-    let api = kratos(kratos_admin)?;
-    let id = identity_for(&api, email).await?.id;
-    api.set_state(id, IdentityState::Active).await?;
+    let accounts = accounts(kratos_admin)?;
+    let id = id_for(&accounts, email).await?;
+    accounts.set_state(id, IdentityState::Active).await?;
     println!("{email} ({id}): active again");
     Ok(())
 }
 
 pub async fn recover(email: &Email, kratos_admin: &KratosAdmin) -> anyhow::Result<()> {
-    let api = kratos(kratos_admin)?;
-    let id = identity_for(&api, email).await?.id;
-    let code = api.recovery_code(id).await?;
+    let accounts = accounts(kratos_admin)?;
+    let id = id_for(&accounts, email).await?;
+    let code = accounts.recovery_code(id).await?;
     println!(
         "Send this to {email} (valid 1h):\n  link: {}\n  code: {}",
         code.recovery_link, code.recovery_code
@@ -232,28 +190,58 @@ pub async fn recover(email: &Email, kratos_admin: &KratosAdmin) -> anyhow::Resul
     Ok(())
 }
 
-/// Deletes the Kratos identity, then this service's data. Kratos first: once the
-/// identity is gone, no request can reach us for this user, so nothing can re-create
-/// the row we're about to delete. (The other way round, a request in between would
-/// leave an orphan.) If the second step fails, `forget-user <id>` finishes the job.
+/// The Kratos identity, then this service's data (see `Directory::delete` for why in
+/// that order). If the second step fails, `forget-user <id>` finishes the job.
 pub async fn delete_user(
     email: &Email,
     database: &Database,
     kratos_admin: &KratosAdmin,
 ) -> anyhow::Result<()> {
-    let api = kratos(kratos_admin)?;
-    let id = identity_for(&api, email).await?.id;
-    // Connect first, so a bad database setting fails before anything is deleted.
-    let db = db::connect(database).await?;
-    api.delete_identity(id).await?;
+    let directory = directory(database, kratos_admin).await?;
+    let id = id_for(directory.accounts(), email).await?;
+    let deleted = directory
+        .delete(Actor::Operator, id)
+        .await
+        .map_err(|err| match err {
+            DirectoryError::DataLeftBehind { .. } => {
+                anyhow::Error::new(err).context(format!("finish with `forget-user {id}`"))
+            }
+            err => err.into(),
+        })?;
     println!("{email} ({id}): deleted from Kratos");
-    let deleted = db::delete_user(&db, id).await.with_context(|| {
-        format!("deleting the user-service data; finish with `forget-user {id}`")
-    })?;
-    if deleted {
+    if deleted.had_data {
         println!("{email} ({id}): user-service data deleted");
     } else {
-        println!("{email} ({id}): no user-service data (never logged in through Oathkeeper)");
+        println!("{email} ({id}): no user-service data");
+    }
+    Ok(())
+}
+
+pub async fn reconcile(database: &Database, kratos_admin: &KratosAdmin) -> anyhow::Result<()> {
+    let done = directory(database, kratos_admin).await?.reconcile().await?;
+    let report = |ids: &[Uuid], what: &str| {
+        if !ids.is_empty() {
+            println!("{} {what}:", ids.len());
+            for id in ids {
+                println!("  {id}");
+            }
+        }
+    };
+    report(
+        &done.created,
+        "user(s) had no user-service data: created, with the `user` role",
+    );
+    report(&done.refreshed, "stale email copy(ies): refreshed");
+    report(
+        &done.skipped,
+        "Kratos identity(ies) without a valid email: skipped",
+    );
+    report(
+        &done.orphans,
+        "row(s) without a Kratos identity: left alone, remove with `forget-user <id>`",
+    );
+    if done == Reconciled::default() {
+        println!("in sync: every Kratos identity has its user-service data");
     }
     Ok(())
 }
@@ -265,18 +253,18 @@ pub async fn forget_user(
     database: &Database,
     kratos_admin: &KratosAdmin,
 ) -> anyhow::Result<()> {
+    let directory = directory(database, kratos_admin).await?;
     let (label, id) = match target {
         EmailOrId::Id(id) => (id.to_string(), *id),
         EmailOrId::Email(email) => {
-            let id = identity_for(&kratos(kratos_admin)?, email).await?.id;
+            let id = id_for(directory.accounts(), email).await?;
             (format!("{email} ({id})"), id)
         }
     };
-    let db = db::connect(database).await?;
-    if db::delete_user(&db, id).await? {
+    if directory.forget(id).await? {
         println!("{label}: user-service data deleted");
     } else {
-        println!("{label}: no user-service data (never logged in through Oathkeeper)");
+        println!("{label}: no user-service data");
     }
     Ok(())
 }

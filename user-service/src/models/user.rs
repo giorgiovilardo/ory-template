@@ -33,3 +33,34 @@ pub struct Profile<'a> {
     pub display_name: Option<&'a DisplayName>,
     pub roles: &'a [Role],
 }
+
+/// What admin views (the CLI's `user`, the admin API) show of a user's row; the id and
+/// email come from the Kratos identity. Fields are listed (exhaustive destructuring
+/// below), so a new column shows up here only by decision, as in `MeResponse`.
+#[derive(Debug, Serialize)]
+pub struct StoredUser {
+    pub display_name: Option<DisplayName>,
+    pub roles: Vec<Role>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+impl From<UserWithRoles> for StoredUser {
+    fn from(UserWithRoles { user, roles }: UserWithRoles) -> Self {
+        let User {
+            id: _,
+            email: _,
+            display_name,
+            created_at,
+            updated_at,
+        } = user;
+        Self {
+            display_name,
+            roles,
+            created_at,
+            updated_at,
+        }
+    }
+}

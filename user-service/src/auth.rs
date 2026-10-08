@@ -8,16 +8,20 @@ use std::time::Duration;
 use axum::extract::{FromRef, FromRequestParts};
 use axum::http::request::Parts;
 use axum_extra::TypedHeader;
-use axum_extra::headers::Authorization;
-use axum_extra::headers::authorization::Bearer;
+use axum_extra::headers::authorization::{Basic, Bearer};
+use axum_extra::headers::{Authorization, HeaderMapExt};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
+use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::db;
 use crate::error::AppError;
+use crate::models::Role;
 
 /// After a successful fetch, unknown key ids trigger another at most this often (key
 /// rotation support without letting garbage tokens hammer Oathkeeper).
@@ -193,6 +197,46 @@ where
     }
 }
 
+/// Whether the request carries exactly these Basic credentials. For the internal
+/// listener's callers (Oathkeeper's hydrator, Kratos' web hook), each with its own
+/// password. Constant-time comparison: don't leak how much of the password matched.
+pub fn has_basic_credentials(parts: &Parts, username: &str, password: &str) -> bool {
+    let Some(Authorization(basic)) = parts.headers.typed_get::<Authorization<Basic>>() else {
+        return false;
+    };
+    let user_ok = basic.username().as_bytes().ct_eq(username.as_bytes());
+    let password_ok = basic.password().as_bytes().ct_eq(password.as_bytes());
+    (user_ok & password_ok).into()
+}
+
+/// Extractor: a valid JWT whose subject has the `admin` role. The role is read from the
+/// database on every request, never from the token (which carries the roles only for
+/// downstream services): a revoked admin loses access on their next request. Taking
+/// `AdminClaims` instead of `Claims` is the whole authorization check, so a handler
+/// can't forget it.
+#[derive(Debug)]
+pub struct AdminClaims {
+    pub sub: Uuid,
+}
+
+impl<S> FromRequestParts<S> for AdminClaims
+where
+    Arc<JwtVerifier>: FromRef<S>,
+    PgPool: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Claims { sub } = Claims::from_request_parts(parts, state).await?;
+        if db::has_role(&PgPool::from_ref(state), sub, Role::Admin).await? {
+            Ok(Self { sub })
+        } else {
+            Err(AppError::Forbidden("requires the admin role"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -365,5 +409,70 @@ mod tests {
         tokio::time::advance(MIN_REFRESH_INTERVAL).await;
         assert!(verifier.verify(&unknown).await.is_err());
         assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+    }
+
+    mod admin_claims {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::extract::FromRef;
+        use axum::http::{Request, StatusCode, header};
+        use axum::routing::get;
+        use serde_json::json;
+        use sqlx::PgPool;
+
+        use super::*;
+
+        #[derive(Clone, FromRef)]
+        struct State {
+            db: PgPool,
+            verifier: Arc<JwtVerifier>,
+        }
+
+        async fn call(db: &PgPool, sub: Option<Uuid>) -> (StatusCode, serde_json::Value) {
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(|admin: AdminClaims| async move { axum::Json(admin.sub) }),
+                )
+                .with_state(State {
+                    db: db.clone(),
+                    verifier: Arc::new(verifier()),
+                });
+            let mut req = Request::get("/");
+            if let Some(sub) = sub {
+                let token = token(json!({ "sub": sub }));
+                req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            send(app, req.body(Body::empty()).unwrap()).await
+        }
+
+        #[sqlx::test]
+        async fn requires_a_valid_token(db: PgPool) {
+            let (status, body) = call(&db, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body["error"]["code"], "unauthorized");
+        }
+
+        #[sqlx::test]
+        async fn requires_the_admin_role_from_the_database(db: PgPool) {
+            let id = Uuid::new_v4();
+            // No row at all, then a row without the role: both forbidden.
+            for _ in 0..2 {
+                let (status, body) = call(&db, Some(id)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(body["error"]["code"], "forbidden");
+                db::sync_identity(&db, &identity(id, "ada@example.com"))
+                    .await
+                    .unwrap();
+            }
+
+            db::grant_role(&db, id, Role::Admin).await.unwrap();
+            let (status, body) = call(&db, Some(id)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!(id));
+
+            db::revoke_role(&db, id, Role::Admin).await.unwrap();
+            assert_eq!(call(&db, Some(id)).await.0, StatusCode::FORBIDDEN);
+        }
     }
 }

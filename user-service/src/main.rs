@@ -1,9 +1,11 @@
 mod admin;
+mod admin_api;
 mod api;
 mod auth;
 mod cli;
 mod config;
 mod db;
+mod directory;
 mod error;
 mod hydrate;
 mod kratos;
@@ -11,6 +13,7 @@ mod models;
 mod server;
 #[cfg(test)]
 mod testing;
+mod webhook;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;

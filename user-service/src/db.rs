@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgConnection, PgPool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -132,15 +132,56 @@ pub async fn roles_of(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<Role>> {
     .await
 }
 
-/// Every user's roles, for listings. Users with no row yet (never made a request) are absent.
-pub async fn all_roles(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Vec<Role>)>> {
-    let rows = sqlx::query!(
-        r#"select id, array(select role from user_roles where user_id = users.id order by role) as "roles!: Vec<Role>"
-           from users"#
+pub async fn has_role(db: &PgPool, id: Uuid, role: Role) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
+        r#"select exists (select 1 from user_roles where user_id = $1 and role = $2) as "exists!""#,
+        id,
+        role as Role
+    )
+    .fetch_one(db)
+    .await
+}
+
+/// Serializes the checks-then-changes that take admin access away (see
+/// `Directory::guard`) until the transaction ends. Any constant would do; this one is
+/// only ever used here.
+pub async fn lock_admin_changes(tx: &mut PgConnection) -> sqlx::Result<()> {
+    const ADMIN_CHANGES: i64 = 0x7573_6572_6164_6d6e; // "useradmn"
+    sqlx::query!("select from pg_advisory_xact_lock($1)", ADMIN_CHANGES)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+pub async fn admin_ids(conn: &mut PgConnection) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar!(
+        "select user_id from user_roles where role = $1",
+        Role::Admin as Role
+    )
+    .fetch_all(conn)
+    .await
+}
+
+/// Every user id with a row (for `reconcile`).
+pub async fn all_user_ids(db: &PgPool) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar!("select id from users")
+        .fetch_all(db)
+        .await
+}
+
+/// The users among `ids` that have a row, with their roles, in one query (for listings).
+/// Ids without a row (no data yet) are simply absent.
+pub async fn find_many_with_roles(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<UserWithRoles>> {
+    sqlx::query_as!(
+        UserWithRolesRow,
+        r#"select id, email as "email: Email", display_name as "display_name: DisplayName", created_at, updated_at,
+                  array(select role from user_roles where user_id = users.id order by role) as "roles!: Vec<Role>"
+           from users where id = any($1)"#,
+        ids
     )
     .fetch_all(db)
-    .await?;
-    Ok(rows.into_iter().map(|row| (row.id, row.roles)).collect())
+    .await
+    .map(|rows| rows.into_iter().map(Into::into).collect())
 }
 
 /// `None` clears the display name. Returns `None` if the user doesn't exist.
@@ -306,8 +347,10 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(!has_role(&db, id, Role::Admin).await.unwrap());
         assert!(grant_role(&db, id, Role::Admin).await.unwrap());
         assert!(!grant_role(&db, id, Role::Admin).await.unwrap());
+        assert!(has_role(&db, id, Role::Admin).await.unwrap());
         assert_eq!(
             roles_of(&db, id).await.unwrap(),
             vec![Role::Admin, Role::User]
@@ -319,8 +362,8 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn lists_everyones_roles(db: PgPool) {
-        let (ada, bob) = (Uuid::new_v4(), Uuid::new_v4());
+    async fn finds_many_users_with_their_roles(db: PgPool) {
+        let (ada, bob, nobody) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         sync_identity(&db, &identity(ada, "ada@example.com"))
             .await
             .unwrap();
@@ -330,12 +373,16 @@ mod tests {
         grant_role(&db, ada, Role::Admin).await.unwrap();
         revoke_role(&db, bob, Role::User).await.unwrap();
 
-        let mut all = all_roles(&db).await.unwrap();
-        all.sort_by_key(|(id, _)| *id != ada);
+        let mut found = find_many_with_roles(&db, &[ada, bob, nobody])
+            .await
+            .unwrap();
+        found.sort_by_key(|u| u.user.id != ada);
+        let found: Vec<_> = found.into_iter().map(|u| (u.user.id, u.roles)).collect();
         assert_eq!(
-            all,
+            found,
             vec![(ada, vec![Role::Admin, Role::User]), (bob, vec![])]
         );
+        assert_eq!(find_many_with_roles(&db, &[]).await.unwrap().len(), 0);
     }
 
     #[sqlx::test]

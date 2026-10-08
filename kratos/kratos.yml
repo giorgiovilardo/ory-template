@@ -59,6 +59,32 @@ selfservice:
       ui_url: http://localhost:4455/settings
       privileged_session_max_age: 15m
       required_aal: highest_available
+      after:
+        # The profile method is where the email (the only trait) changes.
+        profile:
+          hooks:
+            # The user-service web hook: tells user-service an identity was saved, so it
+            # creates the user's row (with the `user` role) at registration and keeps its
+            # email copy current. Defined here (YAML anchor) and reused by every
+            # registration method below. Runs after the identity is persisted
+            # (`parse: false`) and synchronously (`ignore: false`): Kratos retries 5xx,
+            # then fails the flow, but the identity exists either way; `just reconcile`
+            # catches up on anything missed. The password comes from .env
+            # (KRATOS_WEBHOOK_PASSWORD), set by docker-compose.yml for each use.
+            - &user_service_hook
+              hook: web_hook
+              config:
+                url: http://user-service:3001/internal/kratos/identity
+                method: POST
+                body: file:///etc/config/kratos/webhooks/identity.jsonnet
+                response:
+                  parse: false
+                  ignore: false
+                auth:
+                  type: basic_auth
+                  config:
+                    user: kratos
+                    password: overridden-by-env
 
     recovery:
       enabled: true
@@ -83,19 +109,25 @@ selfservice:
     registration:
       ui_url: http://localhost:4455/registration
       lifespan: 10m
+      # Each method: the user-service web hook first, so a session is issued only once
+      # the user's row exists.
       after:
         password:
           hooks:
+            - *user_service_hook
             - hook: session
             - hook: show_verification_ui
         code:
           hooks:
+            - *user_service_hook
             - hook: session
         passkey:
           hooks:
+            - *user_service_hook
             - hook: session
         oidc:
           hooks:
+            - *user_service_hook
             - hook: session
 
 session:

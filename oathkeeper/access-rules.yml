@@ -75,3 +75,26 @@
     - handler: cookie
   errors:
     - handler: json
+
+# user-service admin API (/api/admin/users/**): only users with the `admin` role, which
+# user-service checks against its own database on every request (403 otherwise).
+# Its own rule rather than more methods on users-api: that one stays GET/PUT for users'
+# own data, and admin access can be tightened here without touching it. The prefix names
+# the service, so /api/admin/<other-service>/** stays free for other services.
+- id: users-admin-api
+  match:
+    url: http://localhost:8080/api/admin/users<{,/**}>
+    methods: [GET, POST, PUT, DELETE]
+  upstream:
+    url: http://user-service:3000
+  authenticators:
+    - handler: cookie_session
+    - handler: bearer_token
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: hydrator
+    - handler: id_token
+    - handler: cookie
+  errors:
+    - handler: json
