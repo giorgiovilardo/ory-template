@@ -1,4 +1,5 @@
 mod admin;
+mod admin_api;
 mod api;
 mod auth;
 mod cli;

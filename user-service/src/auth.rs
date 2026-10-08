@@ -202,10 +202,6 @@ where
 /// `AdminClaims` instead of `Claims` is the whole authorization check, so a handler
 /// can't forget it.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the admin API (next commit) uses it")
-)]
 pub struct AdminClaims {
     pub sub: Uuid,
 }

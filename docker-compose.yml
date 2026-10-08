@@ -130,7 +130,7 @@ services:
 
   # Owns user data (profile, roles), keyed by the Kratos identity id. Hydrates every
   # JWT via Oathkeeper. Not published on the host: :3000 is reached through Oathkeeper
-  # (/api/users/**), :3001 (/internal/hydrate) only by Oathkeeper itself.
+  # (/api/users/**, /api/admin/users/**), :3001 (/internal/hydrate) only by Oathkeeper itself.
   # Applies user-service's migrations (embedded in its binary), then exits.
   # Same image as user-service; runs on every `up`, a no-op when nothing is pending.
   user-service-migrate:
@@ -153,6 +153,8 @@ services:
       HYDRATOR_PASSWORD: ${HYDRATOR_PASSWORD}
       JWKS_URL: http://oathkeeper:4456/.well-known/jwks.json
       JWT_ISSUER: http://localhost:8080/
+      # The admin API and CLI act on identities through it. Compose network only: the
+      # Kratos admin API is never routed through Oathkeeper.
       KRATOS_ADMIN_URL: http://kratos:4434
       RUST_LOG: info,user_service=debug,sqlx=warn
     depends_on:

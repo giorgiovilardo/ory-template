@@ -88,7 +88,8 @@ async fn shows_a_users_details(db: PgPool) {
     let details = directory.details(id).await.unwrap();
     assert_eq!(details.raw_identity["traits"]["email"], "ada@example.com");
     assert_eq!(details.raw_identity["id"], json!(id));
-    assert_eq!(details.stored.unwrap().roles, vec![Role::User]);
+    assert_eq!(details.user.stored.unwrap().roles, vec![Role::User]);
+    assert_eq!(details.user.identity.state, "active");
 
     assert!(matches!(
         directory.details(Uuid::new_v4()).await,
@@ -160,7 +161,10 @@ async fn revoking_needs_data(db: PgPool) {
     let (directory, kratos) = directory(&db);
     let id = existing_user(&db, &kratos, "ada@example.com").await;
 
-    let change = directory.revoke_role(id, Role::User).await.unwrap();
+    let change = directory
+        .revoke_role(Actor::Operator, id, Role::User)
+        .await
+        .unwrap();
     assert_eq!(
         change,
         RoleChange {
@@ -168,11 +172,17 @@ async fn revoking_needs_data(db: PgPool) {
             roles: vec![]
         }
     );
-    assert!(!directory.revoke_role(id, Role::User).await.unwrap().changed);
+    assert!(
+        !directory
+            .revoke_role(Actor::Operator, id, Role::User)
+            .await
+            .unwrap()
+            .changed
+    );
 
     let no_row = kratos.add(FakeIdentity::new("bob@example.com"));
     assert!(matches!(
-        directory.revoke_role(no_row, Role::User).await,
+        directory.revoke_role(Actor::Operator, no_row, Role::User).await,
         Err(DirectoryError::NoUserData(i)) if i == no_row
     ));
 }
@@ -214,18 +224,18 @@ async fn deletes_both_halves(db: PgPool) {
     let no_row = kratos.add(FakeIdentity::new("bob@example.com"));
 
     assert_eq!(
-        directory.delete(id).await.unwrap(),
+        directory.delete(Actor::Operator, id).await.unwrap(),
         Deleted { had_data: true }
     );
     assert!(kratos.get(id).is_none());
     assert!(db::find_by_id(&db, id).await.unwrap().is_none());
 
     assert_eq!(
-        directory.delete(no_row).await.unwrap(),
+        directory.delete(Actor::Operator, no_row).await.unwrap(),
         Deleted { had_data: false }
     );
     assert!(matches!(
-        directory.delete(id).await,
+        directory.delete(Actor::Operator, id).await,
         Err(DirectoryError::NoSuchUser(_))
     ));
 }
@@ -238,7 +248,7 @@ async fn delete_keeps_the_data_when_kratos_fails(db: PgPool) {
     kratos.fail(Op::Delete);
 
     assert!(matches!(
-        directory.delete(id).await,
+        directory.delete(Actor::Operator, id).await,
         Err(DirectoryError::Kratos(_))
     ));
     assert!(kratos.get(id).is_some());
@@ -252,7 +262,7 @@ async fn delete_reports_data_left_behind(options: PgPoolOptions, connect: PgConn
     let id = existing_user(&db, &kratos, "ada@example.com").await;
     let broken = Directory::new(closed, kratos.clone());
 
-    let err = broken.delete(id).await.unwrap_err();
+    let err = broken.delete(Actor::Operator, id).await.unwrap_err();
     assert!(
         matches!(err, DirectoryError::DataLeftBehind { id: i, .. } if i == id),
         "{err:?}"
@@ -263,4 +273,235 @@ async fn delete_reports_data_left_behind(options: PgPoolOptions, connect: PgConn
     let directory = Directory::new(db.clone(), kratos);
     assert!(directory.forget(id).await.unwrap());
     assert!(!directory.forget(id).await.unwrap());
+}
+
+#[sqlx::test]
+async fn pages_through_users(db: PgPool) {
+    let (directory, kratos) = directory(&db);
+    let with_row = existing_user(&db, &kratos, "ada@example.com").await;
+    for i in 0..4 {
+        kratos.add(FakeIdentity::new(&format!("user{i}@example.com")));
+    }
+
+    let mut seen = Vec::new();
+    let mut token = None;
+    loop {
+        let page = directory.page(2, token.as_deref()).await.unwrap();
+        assert!(page.users.len() <= 2);
+        seen.extend(page.users);
+        match page.next_page_token {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 5);
+    let ada = seen.iter().find(|u| u.identity.id == with_row).unwrap();
+    assert_eq!(ada.stored.as_ref().unwrap().roles, vec![Role::User]);
+}
+
+#[sqlx::test]
+async fn looks_up_every_user_with_an_email(db: PgPool) {
+    let (directory, kratos) = directory(&db);
+    let ada = existing_user(&db, &kratos, "ada@example.com").await;
+    kratos.add(FakeIdentity::new("bob@example.com"));
+
+    let found = directory
+        .with_email(&email("ada@example.com"))
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].identity.id, ada);
+    assert!(found[0].stored.is_some());
+
+    let twin = kratos.add(FakeIdentity::new("ada@example.com"));
+    let found = directory
+        .with_email(&email("ada@example.com"))
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 2, "a lookup returns every match");
+    assert!(
+        found
+            .iter()
+            .any(|u| u.identity.id == twin && u.stored.is_none())
+    );
+
+    assert!(
+        directory
+            .with_email(&email("nobody@example.com"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[sqlx::test]
+async fn invites_without_a_password(db: PgPool) {
+    let (directory, kratos) = directory(&db);
+
+    let invited = directory.invite(&email("ada@example.com")).await.unwrap();
+    let id = invited.user.identity.id;
+    let identity = kratos.get(id).unwrap();
+    assert_eq!(identity.password, None);
+    assert!(!identity.verified, "proven by following the recovery link");
+    assert_eq!(invited.user.stored.unwrap().roles, vec![Role::User]);
+    assert!(invited.recovery.recovery_link.contains(&id.to_string()));
+
+    let err = directory
+        .invite(&email("ada@example.com"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Conflict(_)), "{err:?}");
+}
+
+#[sqlx::test]
+async fn failed_invites_leave_nothing_behind(options: PgPoolOptions, connect: PgConnectOptions) {
+    let (db, closed) = open_and_closed(options, connect).await;
+
+    // The row can't be written: the identity is deleted again.
+    let (broken, kratos) = directory(&closed);
+    assert!(broken.invite(&email("ada@example.com")).await.is_err());
+    assert!(kratos.get_by_email("ada@example.com").is_none());
+
+    // No recovery code: identity and row are both deleted again.
+    let (directory, kratos) = directory(&db);
+    kratos.fail(Op::Recovery);
+    let err = directory
+        .invite(&email("ada@example.com"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Kratos(_)), "{err:?}");
+    assert!(kratos.get_by_email("ada@example.com").is_none());
+    let rows = sqlx::query_scalar!("select count(*) from users")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(rows, Some(0));
+}
+
+#[sqlx::test]
+async fn deleting_again_finishes_a_partial_delete(
+    options: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let (db, closed) = open_and_closed(options, connect).await;
+    let kratos = FakeKratos::default();
+    let id = existing_user(&db, &kratos, "ada@example.com").await;
+    let broken = Directory::new(closed, kratos.clone());
+    assert!(broken.delete(Actor::Operator, id).await.is_err());
+
+    let directory = Directory::new(db.clone(), kratos);
+    assert_eq!(
+        directory.delete(Actor::Operator, id).await.unwrap(),
+        Deleted { had_data: true }
+    );
+    assert!(db::find_by_id(&db, id).await.unwrap().is_none());
+    assert!(matches!(
+        directory.delete(Actor::Operator, id).await,
+        Err(DirectoryError::NoSuchUser(_))
+    ));
+}
+
+async fn admin_ids(db: &PgPool) -> Vec<Uuid> {
+    db::admin_ids(&mut db.acquire().await.unwrap())
+        .await
+        .unwrap()
+}
+
+/// Two admins with rows and the admin role, both active in Kratos.
+async fn two_admins(db: &PgPool, kratos: &FakeKratos) -> (Uuid, Uuid) {
+    let ada = existing_user(db, kratos, "ada@example.com").await;
+    let bob = existing_user(db, kratos, "bob@example.com").await;
+    for id in [ada, bob] {
+        db::grant_role(db, id, Role::Admin).await.unwrap();
+    }
+    (ada, bob)
+}
+
+#[sqlx::test]
+async fn admins_cant_remove_their_own_access(db: PgPool) {
+    let (directory, kratos) = directory(&db);
+    let (ada, _) = two_admins(&db, &kratos).await;
+    let me = Actor::Admin(ada);
+
+    for result in [
+        directory.revoke_role(me, ada, Role::Admin).await.map(drop),
+        directory.deactivate(me, ada).await,
+        directory.delete(me, ada).await.map(drop),
+    ] {
+        assert!(
+            matches!(result, Err(DirectoryError::SelfAction)),
+            "{result:?}"
+        );
+    }
+    assert!(db::has_role(&db, ada, Role::Admin).await.unwrap());
+    assert_eq!(kratos.get(ada).unwrap().state, IdentityState::Active);
+
+    // Dropping their own `user` role takes no admin access away.
+    assert!(directory.revoke_role(me, ada, Role::User).await.is_ok());
+}
+
+#[sqlx::test]
+async fn the_last_active_admin_stays(db: PgPool) {
+    let (directory, kratos) = directory(&db);
+    let (ada, bob) = two_admins(&db, &kratos).await;
+    let carol = existing_user(&db, &kratos, "carol@example.com").await;
+
+    // Bob is inactive, so Ada is the only active admin: nobody can remove her...
+    directory
+        .accounts()
+        .set_state(bob, IdentityState::Inactive)
+        .await
+        .unwrap();
+    let as_bob = Actor::Admin(bob);
+    for result in [
+        directory
+            .revoke_role(as_bob, ada, Role::Admin)
+            .await
+            .map(drop),
+        directory.deactivate(as_bob, ada).await,
+        directory.delete(as_bob, ada).await.map(drop),
+    ] {
+        assert!(
+            matches!(result, Err(DirectoryError::LastAdmin(id)) if id == ada),
+            "{result:?}"
+        );
+    }
+
+    // ...but anyone else, inactive admins included, can be.
+    let as_ada = Actor::Admin(ada);
+    directory.deactivate(as_ada, carol).await.unwrap();
+    directory
+        .revoke_role(as_ada, bob, Role::Admin)
+        .await
+        .unwrap();
+
+    // The CLI is how you get back in, so the rules don't apply to it.
+    directory
+        .revoke_role(Actor::Operator, ada, Role::Admin)
+        .await
+        .unwrap();
+    assert_eq!(admin_ids(&db).await.len(), 0, "nobody is admin now");
+}
+
+#[sqlx::test]
+async fn two_admins_cant_remove_each_other_at_once(db: PgPool) {
+    let (directory, kratos) = directory(&db);
+    let (ada, bob) = two_admins(&db, &kratos).await;
+
+    for _ in 0..20 {
+        let (a, b) = tokio::join!(
+            directory.revoke_role(Actor::Admin(ada), bob, Role::Admin),
+            directory.revoke_role(Actor::Admin(bob), ada, Role::Admin),
+        );
+        let refused = [&a, &b]
+            .iter()
+            .filter(|r| matches!(r, Err(DirectoryError::LastAdmin(_))))
+            .count();
+        assert_eq!(refused, 1, "{a:?} {b:?}");
+        assert_eq!(admin_ids(&db).await.len(), 1);
+        // Restore for the next round.
+        for id in [ada, bob] {
+            db::grant_role(&db, id, Role::Admin).await.unwrap();
+        }
+    }
 }

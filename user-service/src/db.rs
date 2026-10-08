@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgConnection, PgPool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -132,10 +132,6 @@ pub async fn roles_of(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<Role>> {
     .await
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the admin API (next commit) uses it")
-)]
 pub async fn has_role(db: &PgPool, id: Uuid, role: Role) -> sqlx::Result<bool> {
     sqlx::query_scalar!(
         r#"select exists (select 1 from user_roles where user_id = $1 and role = $2) as "exists!""#,
@@ -143,6 +139,26 @@ pub async fn has_role(db: &PgPool, id: Uuid, role: Role) -> sqlx::Result<bool> {
         role as Role
     )
     .fetch_one(db)
+    .await
+}
+
+/// Serializes the checks-then-changes that take admin access away (see
+/// `Directory::guard`) until the transaction ends. Any constant would do; this one is
+/// only ever used here.
+pub async fn lock_admin_changes(tx: &mut PgConnection) -> sqlx::Result<()> {
+    const ADMIN_CHANGES: i64 = 0x7573_6572_6164_6d6e; // "useradmn"
+    sqlx::query!("select from pg_advisory_xact_lock($1)", ADMIN_CHANGES)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+pub async fn admin_ids(conn: &mut PgConnection) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar!(
+        "select user_id from user_roles where role = $1",
+        Role::Admin as Role
+    )
+    .fetch_all(conn)
     .await
 }
 

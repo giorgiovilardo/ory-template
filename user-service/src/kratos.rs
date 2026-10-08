@@ -2,6 +2,8 @@
 //! `IdentityAdmin` port (`directory.rs`). Only the fields we use are modeled; serde
 //! ignores the rest, so Kratos adding fields never breaks us.
 
+use std::collections::BTreeMap;
+
 use reqwest::header::{HeaderMap, LINK};
 use reqwest::{RequestBuilder, Response, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -44,6 +46,9 @@ pub struct Identity {
     pub verifiable_addresses: Vec<VerifiableAddress>,
     #[serde(default)]
     pub created_at: String,
+    /// Login methods by type (`password`, `oidc`, `totp`, ...). Only the keys are used.
+    #[serde(default)]
+    pub credentials: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -88,10 +93,20 @@ pub enum IdentityState {
     Inactive,
 }
 
-#[derive(Debug, Deserialize)]
+/// Secrets: never log them.
+#[derive(Deserialize)]
+#[expect(clippy::struct_field_names, reason = "Kratos' field names")]
 pub struct RecoveryCode {
     pub recovery_link: String,
     pub recovery_code: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+impl std::fmt::Debug for RecoveryCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryCode").finish_non_exhaustive()
+    }
 }
 
 /// A failed call to the Kratos admin API. `Status` carries Kratos' own explanation,
@@ -123,6 +138,14 @@ impl KratosError {
     pub fn status(&self) -> Option<StatusCode> {
         match self {
             Self::Status { status, .. } => Some(*status),
+            Self::Transport { .. } | Self::Response { .. } => None,
+        }
+    }
+
+    /// Kratos' explanation, when it answered with an error.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Status { reason, .. } => Some(reason),
             Self::Transport { .. } | Self::Response { .. } => None,
         }
     }
@@ -266,21 +289,25 @@ impl IdentityAdmin for AdminApi {
         Ok(sessions.len())
     }
 
-    /// Creates an identity that logs in with this email and password. The email is
-    /// marked verified, so the user can log in right away.
+    /// With a password, the identity logs in with it and its email is marked verified,
+    /// so the user can log in right away (dev seeding). Without one it has no
+    /// credentials yet: an invite, completed through a recovery link.
     async fn create_identity(
         &self,
         email: &Email,
-        password: &str,
+        password: Option<&str>,
     ) -> Result<KratosIdentity, KratosError> {
-        let body = json!({
-            "schema_id": "default",
-            "traits": { "email": email },
-            "credentials": { "password": { "config": { "password": password } } },
-            "verifiable_addresses": [
-                { "value": email, "via": "email", "verified": true, "status": "completed" }
-            ],
-        });
+        let body = match password {
+            Some(password) => json!({
+                "schema_id": "default",
+                "traits": { "email": email },
+                "credentials": { "password": { "config": { "password": password } } },
+                "verifiable_addresses": [
+                    { "value": email, "via": "email", "verified": true, "status": "completed" }
+                ],
+            }),
+            None => json!({ "schema_id": "default", "traits": { "email": email } }),
+        };
         self.send_json(self.http.post(self.identities()).json(&body))
             .await
     }
@@ -492,7 +519,10 @@ mod tests {
         let url = crate::testing::spawn(app).await;
 
         let email: Email = "ada@example.com".parse().unwrap();
-        let err = api(&url).create_identity(&email, "pw").await.unwrap_err();
+        let err = api(&url)
+            .create_identity(&email, Some("pw"))
+            .await
+            .unwrap_err();
         assert_eq!(err.status(), Some(StatusCode::CONFLICT));
         assert_eq!(
             err.to_string(),
@@ -511,6 +541,7 @@ mod tests {
             state: String::new(),
             verifiable_addresses: Vec::new(),
             created_at: String::new(),
+            credentials: BTreeMap::new(),
         };
         assert!(listed(Some(" Ada@Example.com")).matching(&wanted).is_some());
         assert!(listed(Some("bob@example.com")).matching(&wanted).is_none());

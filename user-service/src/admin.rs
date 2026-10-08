@@ -2,17 +2,15 @@
 //! needs from config, resolves the email to a Kratos identity id, calls the directory,
 //! and prints the result. The logic (and what "a user" is) lives in `directory.rs`.
 
-use serde::Serialize;
 use serde_json::json;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::cli::EmailOrId;
 use crate::config::{self, Database, KratosAdmin};
 use crate::db;
-use crate::directory::{Accounts, Directory, DirectoryError};
+use crate::directory::{Accounts, Actor, Directory, DirectoryError};
 use crate::kratos::{AdminApi, IdentityState};
-use crate::models::{DisplayName, Email, Role, User, UserWithRoles};
+use crate::models::{Email, Role, StoredUser};
 
 fn kratos(kratos_admin: &KratosAdmin) -> anyhow::Result<AdminApi> {
     Ok(AdminApi::new(config::http_client()?, &kratos_admin.url))
@@ -71,37 +69,6 @@ pub async fn users(database: &Database, kratos_admin: &KratosAdmin) -> anyhow::R
     Ok(())
 }
 
-/// What `user` shows of this service's row; the id and email are already in the
-/// Kratos identity. Fields are listed (exhaustive destructuring below), so a new column
-/// shows up here only by decision, as in `MeResponse`.
-#[derive(Serialize)]
-struct StoredUser {
-    display_name: Option<DisplayName>,
-    roles: Vec<Role>,
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    updated_at: OffsetDateTime,
-}
-
-impl From<UserWithRoles> for StoredUser {
-    fn from(UserWithRoles { user, roles }: UserWithRoles) -> Self {
-        let User {
-            id: _,
-            email: _,
-            display_name,
-            created_at,
-            updated_at,
-        } = user;
-        Self {
-            display_name,
-            roles,
-            created_at,
-            updated_at,
-        }
-    }
-}
-
 pub async fn user(
     email: &Email,
     database: &Database,
@@ -114,7 +81,7 @@ pub async fn user(
     let shown = json!({
         "identity": details.raw_identity,
         "active_sessions": details.active_sessions,
-        "user_service": details.stored.map(StoredUser::from),
+        "user_service": details.user.stored.map(StoredUser::from),
     });
     println!("{}", serde_json::to_string_pretty(&shown)?);
     Ok(())
@@ -161,7 +128,7 @@ pub async fn revoke_role(
 ) -> anyhow::Result<()> {
     let directory = directory(database, kratos_admin).await?;
     let id = id_for(directory.accounts(), email).await?;
-    let change = directory.revoke_role(id, role).await?;
+    let change = directory.revoke_role(Actor::Operator, id, role).await?;
     if change.changed {
         println!("{email} ({id}): revoked {role}");
     } else {
@@ -232,12 +199,15 @@ pub async fn delete_user(
 ) -> anyhow::Result<()> {
     let directory = directory(database, kratos_admin).await?;
     let id = id_for(directory.accounts(), email).await?;
-    let deleted = directory.delete(id).await.map_err(|err| match err {
-        DirectoryError::DataLeftBehind { .. } => {
-            anyhow::Error::new(err).context(format!("finish with `forget-user {id}`"))
-        }
-        err => err.into(),
-    })?;
+    let deleted = directory
+        .delete(Actor::Operator, id)
+        .await
+        .map_err(|err| match err {
+            DirectoryError::DataLeftBehind { .. } => {
+                anyhow::Error::new(err).context(format!("finish with `forget-user {id}`"))
+            }
+            err => err.into(),
+        })?;
     println!("{email} ({id}): deleted from Kratos");
     if deleted.had_data {
         println!("{email} ({id}): user-service data deleted");

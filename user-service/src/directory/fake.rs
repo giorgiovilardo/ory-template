@@ -75,6 +75,14 @@ impl FakeKratos {
         self.state().identities.get(&id).cloned()
     }
 
+    pub fn get_by_email(&self, email: &str) -> Option<FakeIdentity> {
+        self.state()
+            .identities
+            .values()
+            .find(|identity| identity.email == email)
+            .cloned()
+    }
+
     /// From now on, `op` fails as if Kratos answered 500.
     pub fn fail(&self, op: Op) {
         self.state().failing.insert(op);
@@ -142,7 +150,11 @@ impl IdentityAdmin for FakeKratos {
         page_size: u16,
         page_token: Option<&str>,
     ) -> Result<IdentityPage, KratosError> {
-        let after: Option<Uuid> = page_token.map(|token| token.parse().unwrap());
+        // Like Kratos: a token it didn't hand out is a 400.
+        let after: Option<Uuid> = page_token
+            .map(str::parse)
+            .transpose()
+            .map_err(|_| status(StatusCode::BAD_REQUEST, "The page token is invalid"))?;
         let state = self.state();
         let mut rest = state
             .identities
@@ -176,7 +188,7 @@ impl IdentityAdmin for FakeKratos {
     async fn create_identity(
         &self,
         email: &Email,
-        password: &str,
+        password: Option<&str>,
     ) -> Result<KratosIdentity, KratosError> {
         self.check(Op::Create)?;
         if !self.identities_with_email(email).await?.is_empty() {
@@ -186,7 +198,8 @@ impl IdentityAdmin for FakeKratos {
             ));
         }
         let id = self.add(FakeIdentity {
-            password: Some(password.to_owned()),
+            password: password.map(str::to_owned),
+            verified: password.is_some(),
             ..FakeIdentity::new(email.as_ref())
         });
         Ok(crate::testing::identity(id, email.as_ref()))
@@ -211,6 +224,7 @@ impl IdentityAdmin for FakeKratos {
         self.with(id, |_| RecoveryCode {
             recovery_link: format!("http://kratos/recovery?identity={id}"),
             recovery_code: "123456".to_owned(),
+            expires_at: Some("2026-01-02T04:04:05Z".to_owned()),
         })
     }
 

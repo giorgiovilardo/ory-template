@@ -59,6 +59,9 @@ pub struct PublicAddr {
 pub struct ServeConfig {
     #[command(flatten)]
     pub database: Database,
+    /// The admin API acts on Kratos identities through it.
+    #[command(flatten)]
+    pub kratos_admin: KratosAdmin,
     /// Basic-auth password Oathkeeper uses for `/internal/hydrate`.
     #[arg(long, env = "HYDRATOR_PASSWORD", hide_env_values = true)]
     pub hydrator_password: String,
